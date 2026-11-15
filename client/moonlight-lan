@@ -14,6 +14,9 @@
 # Config: ~/.config/gnome-virtual-display/moonlight-lan.conf
 #   HOST=myhost          # host name as Moonlight shows it
 #   LAN_ADDRESS="192.0.2.20 192.0.2.10"   # host addresses on the home LAN, preferred first
+# Several hosts: repeat the pair, each LAN_ADDRESS line after its HOST line.
+#   HOST=laptop
+#   LAN_ADDRESS="192.0.2.30"
 # Reserve each address in the router's DHCP. A host that is sometimes on Ethernet: list its
 # Ethernet address first, then its Wi-Fi one. All are probed at once (2 s at most) and the first
 # one in the list that answers wins.
@@ -22,9 +25,12 @@ set -u
 CONF=${MOONLIGHT_LAN_CONF:-$HOME/.config/gnome-virtual-display/moonlight-lan.conf}
 ML_CONF="$HOME/.var/app/com.moonlight_stream.Moonlight/config/Moonlight Game Streaming Project/Moonlight.conf"
 HOST="" LAN_ADDRESS=""
+# "HOST<TAB>addresses" per host, in the order of the file
+PAIRS=""
 if [ -r "$CONF" ]; then
-  HOST=$(sed -n 's/^[[:space:]]*HOST[[:space:]]*=[[:space:]]*"\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CONF" | tail -1)
-  LAN_ADDRESS=$(sed -n 's/^[[:space:]]*LAN_ADDRESS[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9. ]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CONF" | tail -1)
+  PAIRS=$(sed -n -e 's/^[[:space:]]*HOST[[:space:]]*=[[:space:]]*"\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}[[:space:]]*$/H \1/p' \
+                 -e 's/^[[:space:]]*LAN_ADDRESS[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9. ]*\)"\{0,1\}[[:space:]]*$/A \1/p' "$CONF" |
+    awk '$1 == "H" { h = $2; next } $1 == "A" && h != "" { sub(/^A /, ""); print h "\t" $0; h = "" }')
 fi
 
 fix_address() {
@@ -53,5 +59,7 @@ fix_address() {
   rm -rf "$dir"
 }
 
-fix_address
+while IFS=$'\t' read -r HOST LAN_ADDRESS; do
+  fix_address
+done <<< "$PAIRS"
 exec flatpak run com.moonlight_stream.Moonlight "$@"

@@ -51,6 +51,16 @@ the paired host wins, so the client follows the cable without any change. With b
 Wi-Fi connected, the host already sends through the cable (NetworkManager gives Ethernet the lower
 route metric); the Ethernet address makes the client's packets take it too.
 
+Several hosts paired with the same client: repeat the pair in the same file, each `LAN_ADDRESS`
+line after its `HOST` line. Each host is checked on its own before Moonlight starts.
+
+```
+HOST=desktop
+LAN_ADDRESS="192.0.2.20 192.0.2.10"
+HOST=laptop
+LAN_ADDRESS="192.0.2.30"
+```
+
 Sunshine's own `packetsize` setting only caps the size the client asks for: leave it at 0.
 
 ## 2. Shape the host's downloads during a stream
