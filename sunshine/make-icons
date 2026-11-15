@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Draw the 512x512 cover images of the Sunshine apps (apps.json "image-path").
+
+  make-icons [OUTPUT_DIR]   default: ~/.config/sunshine/assets
+
+Needs Pillow (python3-pillow).
+"""
+import os
+import sys
+from PIL import Image, ImageDraw, ImageFont
+
+OUT = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.config/sunshine/assets")
+os.makedirs(OUT, exist_ok=True)
+S = 512
+
+BG_TOP = (17, 25, 34)
+BG_BOTTOM = (8, 12, 17)
+ACCENT = (77, 209, 197)
+ACCENT_DIM = (38, 96, 92)
+GREY = (140, 155, 168)
+WHITE = (236, 241, 245)
+
+
+def font(size, bold=False):
+    candidates = [
+        "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",            # Fedora
+        "/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",          # Debian, Ubuntu
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",                   # Arch
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            f = ImageFont.truetype(path, size)
+            if bold:
+                try:
+                    f.set_variation_by_name("Bold")
+                except Exception:
+                    pass
+            return f
+    return ImageFont.load_default()
+
+
+def background():
+    img = Image.new("RGB", (S, S), BG_BOTTOM)
+    d = ImageDraw.Draw(img)
+    for y in range(S):
+        t = y / (S - 1)
+        d.line([(0, y), (S, y)], fill=tuple(
+            int(BG_TOP[i] + (BG_BOTTOM[i] - BG_TOP[i]) * t) for i in range(3)))
+    return img
+
+
+def screen(d, box, fill, outline, width=6, radius=10):
+    d.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def label(d, text):
+    f = font(46)
+    w = d.textbbox((0, 0), text, font=f)[2]
+    d.text(((S - w) / 2, S - 96), text, font=f, fill=WHITE)
+
+
+def extend():
+    img = background()
+    d = ImageDraw.Draw(img)
+    # physical monitor, portrait, on the left
+    px0, py0, px1, py1 = 64, 128, 184, 398
+    screen(d, (px0, py0, px1, py1), (24, 34, 44), GREY, width=5)
+    d.rounded_rectangle((px0 + 13, py0 + 13, px1 - 13, py1 - 13), radius=4,
+                        fill=(38, 52, 64))
+    # client screen, 3:2, on the right
+    sx0, sy0 = 232, 178
+    screen(d, (sx0, sy0, sx0 + 234, sy0 + 156), (22, 62, 60), ACCENT, width=8, radius=12)
+    d.rounded_rectangle((sx0 + 15, sy0 + 15, sx0 + 219, sy0 + 141), radius=6,
+                        fill=ACCENT_DIM)
+    # link between the two screens
+    d.line([(px1 + 8, (py0 + py1) // 2), (sx0 - 12, (py0 + py1) // 2)],
+           fill=ACCENT, width=5)
+    label(d, "2 screens")
+    img.save(os.path.join(OUT, "extend.png"))
+
+
+def virtual_only():
+    img = background()
+    d = ImageDraw.Draw(img)
+    sx0, sy0 = 121, 141
+    screen(d, (sx0, sy0, sx0 + 270, sy0 + 180), (22, 62, 60), ACCENT, width=9, radius=14)
+    d.rounded_rectangle((sx0 + 18, sy0 + 18, sx0 + 252, sy0 + 162), radius=6,
+                        fill=ACCENT_DIM)
+    label(d, "1 screen")
+    img.save(os.path.join(OUT, "virtual-only.png"))
+
+
+def remote():
+    """Remote entry: a screen and waves (stream over the internet)."""
+    img = background()
+    d = ImageDraw.Draw(img)
+    sx0, sy0 = 96, 176
+    screen(d, (sx0, sy0, sx0 + 228, sy0 + 152), (22, 62, 60), ACCENT, width=8, radius=12)
+    d.rounded_rectangle((sx0 + 15, sy0 + 15, sx0 + 213, sy0 + 137), radius=6, fill=ACCENT_DIM)
+    # waves: the stream goes over the internet
+    cx, cy = 372, 196
+    d.ellipse((cx - 12, cy - 12, cx + 12, cy + 12), fill=ACCENT)
+    for r in (40, 72, 104):
+        d.arc((cx - r, cy - r, cx + r, cy + r), start=300, end=60, fill=GREY, width=9)
+    label(d, "remote")
+    img.save(os.path.join(OUT, "remote.png"))
+
+
+extend()
+virtual_only()
+remote()
+for name in ("extend.png", "virtual-only.png", "remote.png"):
+    print(name, os.path.getsize(os.path.join(OUT, name)), "bytes")

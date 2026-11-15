@@ -1,0 +1,84 @@
+#!/bin/bash
+# stream-qos on|off|status: while a Sunshine stream runs, shape the TCP traffic that reaches the
+# host's Wi-Fi from the internet (model downloads, updates, backups) so the video keeps the air.
+#
+# Why: when host and client share one Wi-Fi network, the stream crosses the same channel twice
+# (host -> access point -> client). A large download on the host takes most of the airtime and the
+# stream latency climbs from a few ms to 20-40 ms with frozen frames. Lowering the stream bitrate
+# does not help. Shaping the downloads does. See docs/network.md for measurements.
+#
+# How: incoming TCP from outside the LAN is redirected to an ifb interface shaped by CAKE (total
+# rate capped, shared fairly per connection, so a web page or an API call stays fast next to bulk
+# downloads). TCP slows itself down, nothing is cut, full speed comes back on "off".
+# Never shaped: the LAN (Moonlight, ssh), link-local and the IPv6 prefix announced on the Wi-Fi,
+# all UDP (WireGuard/Tailscale, QUIC, a remote client). No effect when the default route is not
+# Wi-Fi: on Ethernet the air is not shared.
+#
+# Runs as root (installed in /usr/local/sbin by install.sh, called through a sudo rule by
+# stream-qos-watch). Rate: RATE=... in /etc/gnome-virtual-display/stream-qos.conf, default 40mbit.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+RATE=40mbit
+CONF=/etc/gnome-virtual-display/stream-qos.conf
+IFB=ifb-stream
+if [ -r "$CONF" ]; then
+  r=$(sed -n 's/^[[:space:]]*RATE[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9]\{1,5\}[kmg]\{0,1\}bit\)"\{0,1\}[[:space:]]*$/\1/p' "$CONF" | tail -1)
+  [ -n "$r" ] && RATE=$r
+fi
+
+wifi_default() {
+  local i
+  i=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+  [ -n "$i" ] && [ -d "/sys/class/net/$i/wireless" ] && echo "$i"
+}
+
+off() {
+  local d i
+  for d in /sys/class/net/*/wireless; do
+    [ -d "$d" ] || continue
+    i=$(basename "$(dirname "$d")")
+    tc qdisc del dev "$i" ingress 2>/dev/null && logger -t stream-qos "off $i"
+  done
+  ip link del "$IFB" 2>/dev/null
+  return 0
+}
+
+on() {
+  local i p
+  i=$(wifi_default) || { logger -t stream-qos "on skipped: default route is not Wi-Fi"; return 0; }
+  tc qdisc show dev "$i" ingress 2>/dev/null | grep -q ingress && return 0
+  modprobe -q ifb numifbs=0; modprobe -q sch_cake
+  ip link show "$IFB" >/dev/null 2>&1 || ip link add "$IFB" type ifb || return 1
+  ip link set "$IFB" up
+  tc qdisc replace dev "$IFB" root cake bandwidth "$RATE" besteffort flows ingress || { off; return 1; }
+  tc qdisc add dev "$i" handle ffff: ingress || { off; return 1; }
+  # LAN: never shaped. Filters of one priority must share a protocol, hence 1 (IPv4) and 2 (IPv6).
+  tc filter add dev "$i" parent ffff: prio 1 protocol ip u32 match ip src 192.168.0.0/16 action pass
+  tc filter add dev "$i" parent ffff: prio 1 protocol ip u32 match ip src 10.0.0.0/8 action pass
+  tc filter add dev "$i" parent ffff: prio 1 protocol ip u32 match ip src 172.16.0.0/12 action pass
+  tc filter add dev "$i" parent ffff: prio 2 protocol ipv6 u32 match ip6 src fe80::/10 action pass
+  p=$(ip -6 route show dev "$i" proto ra 2>/dev/null | awk '$1 ~ /\/64$/ {print $1; exit}')
+  [ -n "$p" ] && tc filter add dev "$i" parent ffff: prio 2 protocol ipv6 u32 match ip6 src "$p" action pass
+  # TCP from the internet (IPv4 and IPv6): to CAKE.
+  tc filter add dev "$i" parent ffff: prio 3 protocol ip u32 match ip protocol 6 0xff \
+    action mirred egress redirect dev "$IFB"
+  tc filter add dev "$i" parent ffff: prio 4 protocol ipv6 u32 match ip6 protocol 6 0xff \
+    action mirred egress redirect dev "$IFB"
+  logger -t stream-qos "on $i $RATE"
+}
+
+case "${1:-status}" in
+  on) on ;;
+  off) off ;;
+  status)
+    for d in /sys/class/net/*/wireless; do
+      [ -d "$d" ] || continue
+      i=$(basename "$(dirname "$d")")
+      if tc qdisc show dev "$i" ingress 2>/dev/null | grep -q ingress; then
+        echo "$i: shaped"; tc -s qdisc show dev "$IFB" | grep -E 'cake|Sent|backlog' | head -3 | sed 's/^/  /'
+      else
+        echo "$i: free"
+      fi
+    done ;;
+  *) echo "usage: stream-qos on|off|status" >&2; exit 2 ;;
+esac

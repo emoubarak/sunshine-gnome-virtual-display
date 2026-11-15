@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/99-sunshine-render.rules
+# Stable /dev/dri/sunshine-render link to the render node of one GPU. renderD128/129 swap with the
+# enumeration order when a machine has two GPUs (for example an external GPU plugged or not).
+# Replace amdgpu with the kernel driver of the GPU that owns the virtual connector (i915, xe, ...).
+SUBSYSTEM=="drm", DRIVERS=="amdgpu", KERNEL=="renderD*", SYMLINK+="dri/sunshine-render"

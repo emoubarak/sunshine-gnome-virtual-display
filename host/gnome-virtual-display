@@ -1,0 +1,2715 @@
+#!/usr/bin/env python3
+"""Virtual display for Sunshine on GNOME Wayland.
+
+Injects an EDID into a free DRM connector (through a small root helper), then
+lays out the desktop on it through Mutter's D-Bus API, so that Moonlight
+streams a monitor that matches the client's screen.
+
+Mutter is the source of truth. The scale, rotation and position chosen in
+Settings > Displays are kept as they are, from one stream to the next. This
+tool only touches the layout when it is unusable: the virtual monitor sits on
+top of a real one, mirrors it, or is detached (the pointer could not cross).
+
+Four modes, stored in ~/.local/state/gnome-virtual-display/mode:
+
+  base    physical monitors only, virtual monitor off (connector still plugged)
+  extend  physical monitors + virtual monitor on the right
+  only    virtual monitor alone, physical monitors off
+  remote  virtual monitor alone at `remote_refresh` Hz (streams over slow links)
+
+Usage:
+  gnome-virtual-display list          # outputs and layout
+  gnome-virtual-display extend        # extended desktop
+  gnome-virtual-display on            # alias of extend
+  gnome-virtual-display only          # the virtual monitor alone
+  gnome-virtual-display remote        # the virtual monitor alone at remote_refresh Hz
+  gnome-virtual-display base          # base layout
+  gnome-virtual-display wait MODE     # Sunshine app command: applies MODE, waits for
+                                      # the end of the stream, goes back to base
+  gnome-virtual-display rotate R [CONNECTOR]  # rotates a monitor (normal, left, right,
+                                      # inverted); default: the first physical monitor
+  gnome-virtual-display scale N [CONNECTOR]   # scale (1.0, 1.25, 1.3333, 1.6667, 2.0);
+                                      # default: the virtual monitor
+  gnome-virtual-display prep MODE     # Sunshine prep-cmd: claims the session, then applies MODE
+  gnome-virtual-display boot          # at login: plugs the virtual connector (off), applies base
+  gnome-virtual-display reapply       # reapplies the current mode (Sunshine start)
+  gnome-virtual-display off           # removes the virtual monitor (unplugs the connector)
+  gnome-virtual-display watch         # watches display changes (service)
+  gnome-virtual-display fix-session   # frozen desktop: restarts GDM (login screen)
+
+Configuration: ~/.config/gnome-virtual-display/config.toml, or the file named
+by $GVD_CONFIG. Every key is optional except `connector`:
+
+  connector       free DRM connector that receives the EDID, as listed in
+                  /sys/class/drm without the cardN- prefix (required)
+  edid            EDID injected by the helper, readable by the user
+                  (/etc/gnome-virtual-display/edid.bin)
+  fallback_scale  scale of a virtual monitor never configured (1.25)
+  remote_refresh  refresh rate of the `remote` mode (60.0)
+  grace           seconds a stream may resume after an abrupt end (90)
+  sunshine_unit   Sunshine's systemd user unit (app-dev.lizardbyte.app.Sunshine.service)
+  sunshine_log    Sunshine's log file (~/.config/sunshine/sunshine.log)
+  flat_mouse_during_stream  flat mouse acceleration while streaming (true)
+  helper          root helper, run as `sudo -n HELPER on|off CONNECTOR`
+                  (/usr/local/sbin/gnome-virtual-display-drm)
+
+Exit code 2: missing or invalid configuration. Exit code 3: gnome-shell does
+not answer on D-Bus (cause in the journal, `journalctl -t gnome-virtual-display`).
+Without a GNOME session (login screen), `prep`, `wait`, `base` and `reapply` do
+nothing and exit 0: Moonlight streams the login screen, so the password can be
+typed remotely.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import syslog
+import time
+import tomllib
+from collections import namedtuple
+from datetime import datetime
+import xml.etree.ElementTree as ET
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+PROG = "gnome-virtual-display"
+BUS = "org.gnome.Mutter.DisplayConfig"
+PATH = "/org/gnome/Mutter/DisplayConfig"
+IFACE = "org.gnome.Mutter.DisplayConfig"
+NORMAL = 0  # Mutter DisplayConfig: 0=normal, 1=90, 2=180, 3=270 degrees
+MODES = ("base", "extend", "only", "remote")
+# Mode names written by older versions of this tool, still accepted when read.
+LEGACY_MODES = {"etendu": "extend", "seul": "only", "distance": "remote"}
+# A D-Bus call to Mutter answers in a few ms. Past 5 s, gnome-shell is frozen:
+# say so quickly instead of waiting 25 s per call (Moonlight gives up with
+# "failed to start" after about 50 s).
+DBUS_TIMEOUT_MS = 5000
+EXIT_CONFIG = 2
+EXIT_SESSION = 3
+# Xwayland freeze confirmed (see xwayland_frozen) for at least this long and
+# seen at least FREEZE_SEEN times: the watcher restarts GDM. The desktop is
+# already lost (killing Xwayland does not bring it back); the login screen, at
+# least, can be streamed.
+FREEZE_DELAY = 60
+FREEZE_SEEN = 3
+GDM_RESTART = ["sudo", "-n", "/usr/bin/systemctl", "restart", "gdm.service"]
+MONITORS_XML = os.path.expanduser("~/.config/monitors.xml")
+STATE_DIR = os.path.expanduser("~/.local/state/gnome-virtual-display")
+MODE_FILE = os.path.join(STATE_DIR, "mode")
+LOCK_FILE = os.path.join(STATE_DIR, "lock")
+PREFS_FILE = os.path.join(STATE_DIR, "prefs.json")
+XML_WRITTEN = os.path.join(STATE_DIR, "monitors-xml.sha256")  # hash of the last file we wrote
+SESSION_FILE = os.path.join(STATE_DIR, "session")
+MOUSE_FILE = os.path.join(STATE_DIR, "mouse")  # acceleration profile to restore after the stream
+MOUSE_SCHEMA = "org.gnome.desktop.peripherals.mouse"
+LEGACY_VIRTUAL = os.path.join(STATE_DIR, "virtual.json")  # older state file, virtual monitor only
+# One table: "upside_down" is the monitors.xml name, "inverted" the one of
+# `rotate`. Mirrored transforms (4 to 7) are not handled: they are written as
+# their unmirrored rotation.
+ROTATIONS = {"normal": 0, "left": 1, "upside_down": 2, "inverted": 2, "right": 3}
+ROTATION_NAMES = {0: "normal", 1: "left", 2: "upside_down", 3: "right"}
+_held_lock = None
+
+
+# --- configuration --------------------------------------------------------
+
+
+DEFAULT_CONFIG = "~/.config/gnome-virtual-display/config.toml"
+# key: (default, type). Every key has a default except `connector`.
+CONFIG_KEYS = {
+    "connector": (None, str),
+    "edid": ("/etc/gnome-virtual-display/edid.bin", str),
+    # Scale used only if the virtual monitor was never configured.
+    "fallback_scale": (1.25, float),
+    # `remote` mode: the virtual monitor alone, at its native size but at this
+    # refresh rate. The stream's bitrate and frame rate come from the client:
+    # Sunshine has no per-app setting.
+    "remote_refresh": (60.0, float),
+    # After an abrupt end (network lost, Moonlight crashed), the client can
+    # resume the stream: Sunshine resumes the app without running `prep` again.
+    # The stream layout is kept that long; past this delay, back to base and
+    # Sunshine is restarted to free the app (otherwise the next click streams
+    # the physical monitor).
+    "grace": (90, int),
+    "sunshine_unit": ("app-dev.lizardbyte.app.Sunshine.service", str),
+    "sunshine_log": ("~/.config/sunshine/sunshine.log", str),
+    "flat_mouse_during_stream": (True, bool),
+    "helper": ("/usr/local/sbin/gnome-virtual-display-drm", str),
+    # Before each stream, give the virtual monitor the resolution and refresh
+    # rate the client asked for (SUNSHINE_CLIENT_WIDTH/HEIGHT/FPS): a new EDID
+    # is injected only when the current one lacks that mode.
+    "match_client": (True, bool),
+}
+# Machine-specific settings, set by configure() (defaults until then).
+CONNECTOR = KERNEL_CONNECTOR = VIRTUAL_PRODUCT = VIRTUAL_NATIVE = None
+# Set by `base` (end of a stream, Sunshine's undo) and `boot`: put the
+# remembered layout of the physical monitors back. The watcher, outside
+# streams, never does: there the live layout (GNOME Settings) is the truth.
+RESTORE = False
+FALLBACK_SCALE = REMOTE_REFRESH = GRACE = None
+SUNSHINE_UNIT = SUNSHINE_LOG = FLAT_MOUSE = HELPER = None
+MATCH_CLIENT = EDID_PATH = None
+_configured = False
+
+Edid = namedtuple("Edid", "product width height refresh modes", defaults=((),))
+EDID_HEADER = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+
+
+class ConfigError(SystemExit):
+    """Missing or invalid configuration (exit code EXIT_CONFIG)."""
+
+    def __init__(self, message):
+        super().__init__(EXIT_CONFIG)
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+def parse_edid(data):
+    """Product name and native mode of an EDID 1.4 base block.
+
+    Native mode: the first detailed timing descriptor, which EDID 1.4 makes
+    the preferred timing. Product name: the 0xFC display descriptor. Each
+    field is None when the block does not carry it. Raises ValueError when
+    the data is not a valid EDID base block (header, length, checksum).
+    """
+    data = bytes(data)
+    if len(data) < 128 or data[:8] != EDID_HEADER:
+        raise ValueError("not an EDID base block")
+    if sum(data[:128]) % 256:
+        raise ValueError("bad EDID checksum")
+    product = width = height = refresh = None
+    modes = []
+    for offset in (54, 72, 90, 108):
+        d = data[offset:offset + 18]
+        clock = d[0] | d[1] << 8  # in 10 kHz; 0 means a display descriptor
+        if clock:
+            w = d[2] | (d[4] & 0xF0) << 4
+            hblank = d[3] | (d[4] & 0x0F) << 8
+            h = d[5] | (d[7] & 0xF0) << 4
+            vblank = d[6] | (d[7] & 0x0F) << 8
+            total = (w + hblank) * (h + vblank)
+            rate = clock * 10_000 / total if total else None
+            if rate:
+                modes.append((w, h, rate))
+            if width is None:
+                width, height, refresh = w, h, rate
+        elif d[3] == 0xFC and product is None:
+            text = d[5:18].split(b"\n", 1)[0]
+            product = text.decode("ascii", "replace").strip() or None
+    return Edid(product, width, height, refresh, tuple(modes))
+
+
+def read_edid(path):
+    """parse_edid() of a file, or None if it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            return parse_edid(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def mutter_name(connector):
+    """Mutter's name for a kernel connector name.
+
+    The kernel (and debugfs) says HDMI-A-1 where Mutter says HDMI-1; DP-N,
+    DVI-D-N and DVI-I-N are the same on both sides. The configuration and the
+    root helper use the kernel name, every comparison with Mutter this one.
+    """
+    if not connector:
+        return None
+    return re.sub(r"^HDMI-A-", "HDMI-", connector)
+
+
+def config_path():
+    return os.path.expanduser(os.environ.get("GVD_CONFIG") or DEFAULT_CONFIG)
+
+
+def read_config_file(path):
+    """Settings of a TOML file ({} if the file does not exist)."""
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"{path}: {e}")
+
+
+def _validated(settings):
+    values = {}
+    for key, (default, kind) in CONFIG_KEYS.items():
+        value = settings.get(key)
+        if value is None:
+            values[key] = default
+            continue
+        if kind is float and isinstance(value, int) and not isinstance(value, bool):
+            value = float(value)
+        if not isinstance(value, kind) or (kind is not bool and isinstance(value, bool)):
+            raise ConfigError(f"{key}: expected {kind.__name__}, got {value!r}")
+        values[key] = value
+    return values
+
+
+def _apply(values, edid):
+    global CONNECTOR, VIRTUAL_PRODUCT, VIRTUAL_NATIVE, FALLBACK_SCALE, REMOTE_REFRESH
+    global GRACE, SUNSHINE_UNIT, SUNSHINE_LOG, FLAT_MOUSE, HELPER, MATCH_CLIENT, EDID_PATH
+    global KERNEL_CONNECTOR
+    KERNEL_CONNECTOR = values["connector"] or None
+    CONNECTOR = mutter_name(KERNEL_CONNECTOR)
+    MATCH_CLIENT = values["match_client"]
+    EDID_PATH = os.path.expanduser(values["edid"])
+    VIRTUAL_PRODUCT = edid.product if edid else None
+    VIRTUAL_NATIVE = (edid.width, edid.height) if edid and edid.width and edid.height else None
+    FALLBACK_SCALE = values["fallback_scale"]
+    REMOTE_REFRESH = values["remote_refresh"]
+    GRACE = values["grace"]
+    SUNSHINE_UNIT = values["sunshine_unit"]
+    SUNSHINE_LOG = os.path.expanduser(values["sunshine_log"])
+    FLAT_MOUSE = values["flat_mouse_during_stream"]
+    HELPER = os.path.expanduser(values["helper"])
+
+
+def configure(**settings):
+    """Sets the machine-specific settings: the defaults, overridden by `settings`.
+
+    `settings` takes the keys of the TOML file (see CONFIG_KEYS). main() calls
+    it once with the content of the file; tests call it directly, without any
+    file. The EDID is read here: its product name identifies the virtual
+    monitor in Mutter, its first detailed timing gives the native mode. If it
+    cannot be read, the virtual monitor is recognised by its connector only.
+
+    Unknown keys are ignored with a warning on stderr (a file written for
+    another version keeps working); a known key with a wrong type is an
+    error. Returns the ignored keys.
+    """
+    global _configured
+    unknown = sorted(set(settings) - set(CONFIG_KEYS))
+    for key in unknown:
+        print(f"{PROG}: unknown configuration key ignored: {key}", file=sys.stderr)
+    values = _validated({k: v for k, v in settings.items() if k in CONFIG_KEYS})
+    _apply(values, read_edid(os.path.expanduser(values["edid"])))
+    _configured = True
+    return unknown
+
+
+def ensure_config():
+    """Loads the configuration file once (unless configure() already ran)."""
+    if not _configured:
+        configure(**read_config_file(config_path()))
+
+
+def require_connector():
+    if not CONNECTOR:
+        raise ConfigError(
+            f"no virtual connector configured: set connector = \"NAME\" in {config_path()} "
+            "(a free connector listed in /sys/class/drm, without the cardN- prefix)")
+
+
+_apply(_validated({}), None)
+
+
+# --- lock -----------------------------------------------------------------
+
+
+def lock(wait=True):
+    """Exclusive lock: a command and the watcher do not step on each other.
+
+    Without it, an `extend` in progress (which turns the virtual monitor on)
+    can be undone by the watcher, which still reads the old mode and
+    reapplies the base layout.
+    """
+    global _held_lock
+    if _held_lock is not None:
+        return _held_lock
+    os.makedirs(STATE_DIR, exist_ok=True)
+    handle = open(LOCK_FILE, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except OSError:
+        handle.close()
+        return None
+    _held_lock = handle
+    return handle
+
+
+def unlock(handle):
+    global _held_lock
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        if _held_lock is handle:
+            _held_lock = None
+
+
+# --- requested state ------------------------------------------------------
+
+
+def normalize_mode(name):
+    """English mode name, from a current or a legacy (French) name."""
+    return LEGACY_MODES.get(name, name)
+
+
+def read_mode():
+    """Current mode: "base", "extend", "only" or "remote" (base by default).
+
+    Mode files written by older versions use French names: they are mapped to
+    the English ones, so an upgrade keeps the current mode.
+    """
+    try:
+        with open(MODE_FILE) as f:
+            mode = normalize_mode(f.read().strip())
+    except OSError:
+        return "base"
+    return mode if mode in MODES else "base"
+
+
+def write_mode(mode):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = MODE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(mode + "\n")
+        os.replace(tmp, MODE_FILE)
+    except OSError:
+        pass
+
+
+def load_prefs():
+    """Remembered monitor settings, from one stream to the next.
+
+    monitors.xml cannot be trusted: in base mode the virtual monitor is merely
+    disabled there (no scale left), and a physical monitor that is off (`only`
+    mode) has no config there at all. Without this memory, a physical monitor
+    would stay off after an `only` stream and the virtual one would fall back
+    to the fallback scale.
+    """
+    prefs = {"virtual": {"scale": FALLBACK_SCALE, "transform": NORMAL,
+                         "x": None, "y": None},
+             "reals": {}}
+    try:
+        with open(PREFS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if isinstance(data.get("virtual"), dict):
+                prefs["virtual"].update(data["virtual"])
+            if isinstance(data.get("reals"), dict):
+                prefs["reals"] = data["reals"]
+            return prefs
+    except (OSError, ValueError):
+        pass
+    try:  # older file, virtual monitor only
+        with open(LEGACY_VIRTUAL) as f:
+            prefs["virtual"].update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return prefs
+
+
+def save_prefs(monitors, logical, learn_disabled=False):
+    """Remembers the layout of every monitor currently shown.
+
+    `learn_disabled` (the watcher, outside streams): a connected physical
+    monitor that is off is remembered as switched off on purpose, but only if
+    GNOME Settings says so in monitors.xml. Mutter also drops a monitor for a
+    moment on its own (Sunshine's KMS capture, a hotplug): that must never be
+    learnt, or the monitor would stay off after every stream.
+    """
+    prefs = load_prefs()
+    before = json.dumps(prefs, sort_keys=True)
+    by_conn = {m[0][0]: m for m in monitors}
+    # During a stream the virtual monitor is primary and the physical ones are
+    # not: that is not the user's choice. Their primary role is only learnt
+    # while the virtual monitor is off, so that base gives it back to the same
+    # monitor when there are several.
+    streaming = any(by_conn.get(c[0]) and is_virtual(by_conn[c[0]])
+                    for g in logical for c in g[5])
+    defaults = stored_defaults() if streaming else {}
+    for g in logical:
+        x, y, scale, transform, primary, mons = g[0], g[1], g[2], g[3], g[4], g[5]
+        for c in mons:
+            mon = by_conn.get(c[0])
+            if not mon:
+                continue
+            mode = mode_by_id(mon, c[1]) or current_mode(mon) or best_mode(mon)
+            if is_virtual(mon):
+                # The virtual monitor's scale and rotation are explicit
+                # settings: an observed state must not overwrite them.
+                stored = prefs.get("virtual") or {}
+                prefs["virtual"] = {
+                    "scale": float(stored.get("scale", scale)),
+                    "transform": int(stored.get("transform", transform)),
+                    "x": int(x), "y": int(y),
+                }
+            elif streaming:
+                # During a stream the physical monitors were moved and lost
+                # the primary role for the virtual one: nothing to learn. A
+                # monitor never seen before is recorded with what monitors.xml
+                # says about it.
+                if c[0] not in prefs["reals"]:
+                    d = defaults.get(c[0], {})
+                    prefs["reals"][c[0]] = {
+                        "x": int(d.get("x", x)), "y": int(d.get("y", y)),
+                        "scale": float(d.get("scale", scale)),
+                        "transform": int(d.get("transform", transform)),
+                        "primary": bool(d.get("primary", False)),
+                        "mode": [mode[1], mode[2], mode[3]] if mode else None,
+                        "enabled": True,
+                    }
+            else:
+                # Outside streams the live layout is the user's (GNOME
+                # Settings): learn all of it.
+                prefs["reals"][c[0]] = {
+                    "x": int(x), "y": int(y), "scale": float(scale),
+                    "transform": int(transform), "primary": bool(primary),
+                    "mode": [mode[1], mode[2], mode[3]] if mode else None,
+                    "enabled": True,
+                }
+    if not streaming:
+        active = {c[0] for g in logical for c in g[5]}
+        disabled = settings_disabled(monitors) if learn_disabled else set()
+        for m in monitors:
+            conn = m[0][0]
+            if conn in active or is_virtual(m) or conn not in prefs["reals"]:
+                continue
+            if conn in disabled:
+                prefs["reals"][conn]["enabled"] = False
+    if json.dumps(prefs, sort_keys=True) == before:
+        return False
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = PREFS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(prefs, f, indent=1)
+        os.replace(tmp, PREFS_FILE)
+    except OSError:
+        return False
+    return True
+
+
+def settings_disabled(monitors):
+    """Physical monitors that GNOME Settings switched off: listed <disabled> in
+    the monitors.xml configuration of this set of monitors, in a file this tool
+    did not write itself (Settings writes it when the user keeps the change)."""
+    try:
+        with open(MONITORS_XML, "rb") as f:
+            data = f.read()
+    except OSError:
+        return set()
+    try:
+        with open(XML_WRITTEN) as f:
+            if f.read().strip() == hashlib.sha256(data).hexdigest():
+                return set()  # our own file: says nothing about the user
+    except OSError:
+        pass
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return set()
+    current = frozenset(monitor_key(m[0]) for m in monitors if not is_virtual(m))
+    for config in root.findall("configuration"):
+        if xml_monitor_set(config) == current:
+            return {spec.findtext("connector") for d in config.findall("disabled")
+                    for spec in d.findall("monitorspec")}
+    return set()
+
+
+def mark_session():
+    """Records that a Sunshine app just started (the watcher must back off).
+
+    Returns the token written: `wait` compares it before restoring base, so
+    it never undoes the next stream.
+    """
+    token = f"{time.time():.6f}"
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = SESSION_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(token)
+        os.replace(tmp, SESSION_FILE)
+    except OSError:
+        pass
+    return token
+
+
+def session_token():
+    try:
+        with open(SESSION_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def clear_session():
+    try:
+        os.unlink(SESSION_FILE)
+    except OSError:
+        pass
+
+
+def session_marked(limit=180):
+    """Did a Sunshine app start less than `limit` seconds ago?
+
+    Covers the short gap between the `prep-cmd` (the layout changes) and the
+    start of the app's `cmd`: without it, the watcher could restore base right
+    then, and Sunshine streamed the physical monitor.
+    """
+    try:
+        stamp = float(session_token() or "")
+    except ValueError:
+        return False
+    return time.time() - stamp < limit
+
+
+# --- Mutter ---------------------------------------------------------------
+
+
+class SessionUnreachable(SystemExit):
+    """gnome-shell does not answer on D-Bus (exit code EXIT_SESSION).
+
+    A SystemExit subclass: callers that catch SystemExit keep working, but
+    `present()` and `active()` let it through (a frozen desktop is not a
+    missing connector).
+    """
+
+    def __init__(self, message):
+        super().__init__(EXIT_SESSION)
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+class NoSession(SessionUnreachable):
+    """No gnome-shell on the bus: login screen, or a session shutting down."""
+
+
+class XwaylandFreeze(SessionUnreachable):
+    """gnome-shell blocked by the Xwayland loop (signature seen)."""
+
+
+def journal(message):
+    """Logs to the journal (`journalctl -t gnome-virtual-display`).
+
+    When Sunshine runs `prep`, its stderr goes nowhere: Sunshine only logs
+    "exited with code [1]".
+    """
+    try:
+        syslog.openlog(PROG, 0, syslog.LOG_USER)
+        syslog.syslog(syslog.LOG_ERR, message)
+    except OSError:
+        pass
+
+
+def xwayland_pid():
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() == "Xwayland":
+                    return int(pid)
+        except OSError:
+            continue
+    return None
+
+
+def cpu_ticks(pid):
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return int(fields[11]) + int(fields[12])
+
+
+def xwayland_frozen():
+    """Known cause of a frozen gnome-shell, or None.
+
+    Xwayland bug (seen in 24.1.14, same code on master at the time of
+    writing): when an X11 client that draws through Present (for example a
+    Chromium-based browser run with --ozone-platform=x11) loses its output,
+    `xwl_present_flush_blocked` keeps putting its frames back into the list it
+    walks. Xwayland spins at full CPU and gnome-shell, which waits for its
+    answer (`meta_xwayland_set_primary_output`), stops answering. Signature:
+    Xwayland at full load, its stack in `xwl_present_*`. Returns the
+    exception to raise, or None.
+    """
+    pid = xwayland_pid()
+    if not pid:
+        return None
+    try:
+        t0 = cpu_ticks(pid)
+        time.sleep(1.5)
+        load = (cpu_ticks(pid) - t0) / os.sysconf("SC_CLK_TCK") / 1.5
+    except (OSError, ValueError):
+        return None
+    if load < 0.9:
+        return None
+    try:
+        out = subprocess.run(["eu-stack", "-1", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    if "xwl_present_flush_blocked" in out or "xwl_present_re_execute" in out:
+        return XwaylandFreeze(
+            f"gnome-shell does not answer: Xwayland (pid {pid}) is looping in "
+            "xwl_present_flush_blocked (Present bug, triggered by an X11 client "
+            "drawing on a monitor that was turned off). Killing Xwayland is not "
+            f"enough: run `{PROG} fix-session`")
+    return SessionUnreachable(
+        f"gnome-shell does not answer: Xwayland (pid {pid}) at {load:.0%} CPU, probably frozen")
+
+
+def proxy():
+    p = Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SESSION,
+        Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES | Gio.DBusProxyFlags.DO_NOT_AUTO_START,
+        None, BUS, PATH, IFACE, None)
+    p.set_default_timeout(DBUS_TIMEOUT_MS)
+    return p
+
+
+def mutter_call(method, arg=None):
+    """Calls Mutter with a bounded timeout.
+
+    On timeout: if the Xwayland freeze signature is there, say so at once;
+    otherwise retry once (a reconfiguration right after a hotplug can be slow)
+    before declaring the session unreachable.
+    """
+    for attempt in (1, 2):
+        p = proxy()
+        if p.get_name_owner() is None:
+            # No gnome-shell on the bus. GLib then fails locally ("without an
+            # owner"): there is no SERVICE_UNKNOWN to wait for.
+            raise NoSession("no GNOME session (login screen?)")
+        try:
+            return p.call_sync(method, arg, Gio.DBusCallFlags.NONE, DBUS_TIMEOUT_MS, None)
+        except GLib.Error as e:
+            if (e.matches(Gio.dbus_error_quark(), Gio.DBusError.SERVICE_UNKNOWN)
+                    or e.matches(Gio.dbus_error_quark(), Gio.DBusError.NAME_HAS_NO_OWNER)):
+                raise NoSession("no GNOME session (login screen?)")
+            if not e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT):
+                raise
+            cause = xwayland_frozen()
+            if isinstance(cause, XwaylandFreeze):
+                raise cause
+            if attempt == 2:
+                if cause:
+                    raise cause
+                raise SessionUnreachable(
+                    f"gnome-shell does not answer ({DBUS_TIMEOUT_MS // 1000} s, twice)")
+
+
+def state():
+    try:
+        res = mutter_call("GetCurrentState")
+    except GLib.Error as e:
+        raise SessionUnreachable(f"GNOME session unreachable: {e.message}")
+    serial, monitors, logical, _props = res.unpack()
+    return serial, monitors, logical
+
+
+def is_virtual(monitor):
+    """Is this the virtual monitor? Its connector, or the product name of the
+    injected EDID (when the EDID could be read)."""
+    connector, _vendor, product, _serial = monitor[0]
+    return connector == CONNECTOR or bool(VIRTUAL_PRODUCT and VIRTUAL_PRODUCT in str(product))
+
+
+def current_mode(monitor):
+    for m in monitor[1]:
+        if m[6].get("is-current"):
+            return m
+    return None
+
+
+def best_mode(monitor):
+    """Current mode, else the preferred mode (monitor connected but disabled),
+    else the highest refresh rate at the EDID's native size."""
+    mode = current_mode(monitor)
+    if mode:
+        return mode
+    preferred = [m for m in monitor[1] if m[6].get("is-preferred")]
+    if preferred:
+        return preferred[0]
+    if VIRTUAL_NATIVE:
+        width, height = VIRTUAL_NATIVE
+        native = [m for m in monitor[1] if m[1] == width and m[2] == height]
+        if native:
+            return max(native, key=lambda m: m[3])
+    return None
+
+
+def mode_by_id(monitor, mode_id):
+    for m in monitor[1]:
+        if m[0] == mode_id:
+            return m
+    return None
+
+
+def mode_for(monitor, wanted):
+    """Requested (width, height, rate) mode if it exists, else the best one."""
+    if wanted:
+        w, h, rate = wanted
+        for m in monitor[1]:
+            if m[1] == w and m[2] == h and (rate is None or abs(m[3] - rate) < 0.6):
+                return m
+    return best_mode(monitor)
+
+
+def rect_of(group, monitors, conns=None):
+    """Logical (x, y, width, height) of a group of monitors."""
+    x, y, scale, transform = group[0], group[1], float(group[2]), group[3]
+    by_conn = {m[0][0]: m for m in monitors}
+    w = h = 0
+    for c in (conns if conns is not None else group[5]):
+        m = by_conn.get(c[0])
+        if not m:
+            continue
+        mode = mode_by_id(m, c[1]) or current_mode(m)
+        if not mode:
+            continue
+        mw, mh = mode[1], mode[2]
+        if int(transform) % 2:  # 90 or 270 degrees, flipped or not
+            mw, mh = mh, mw
+        w, h = max(w, mw), max(h, mh)
+    return (float(x), float(y), w / scale, h / scale)
+
+
+def overlap(a, b):
+    return (a[0] < b[0] + b[2] and b[0] < a[0] + a[2]
+            and a[1] < b[1] + b[3] and b[1] < a[1] + a[3])
+
+
+def touches(a, b, tol=1.5):
+    """The two rectangles share an edge (the pointer can cross)."""
+    if abs((a[0] + a[2]) - b[0]) <= tol or abs((b[0] + b[2]) - a[0]) <= tol:
+        return min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]) > 1
+    if abs((a[1] + a[3]) - b[1]) <= tol or abs((b[1] + b[3]) - a[1]) <= tol:
+        return min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]) > 1
+    return False
+
+
+def stored_defaults():
+    """Stored layout of each connector, from monitors.xml.
+
+    Used to turn a physical monitor that is off back on with its usual
+    rotation, scale and position (portrait, for example).
+    """
+    try:
+        root = ET.parse(MONITORS_XML).getroot()
+    except (OSError, ET.ParseError):
+        return {}
+    out = {}
+    for config in root.findall("configuration"):
+        for lm in config.findall("logicalmonitor"):
+            spec = lm.find("monitor/monitorspec")
+            if spec is None:
+                continue
+            conn = spec.findtext("connector")
+            if not conn or conn in out:
+                continue
+            mode_node = lm.find("monitor/mode")
+            wanted = None
+            if mode_node is not None:
+                try:
+                    wanted = (int(mode_node.findtext("width")),
+                              int(mode_node.findtext("height")),
+                              float(mode_node.findtext("rate")))
+                except (TypeError, ValueError):
+                    wanted = None
+            rot = lm.find("transform/rotation")
+            out[conn] = {
+                "x": int(lm.findtext("x") or 0),
+                "y": int(lm.findtext("y") or 0),
+                "scale": float(lm.findtext("scale") or 1.0),
+                "transform": ROTATIONS.get(rot.text if rot is not None else "normal", NORMAL),
+                "primary": (lm.findtext("primary") or "no") == "yes",
+                "mode": wanted,
+            }
+    return out
+
+
+def real_specs(mons, by_conn):
+    """Applicable specs of the physical monitors of a group.
+
+    Mutter describes the monitors of a logical group by their
+    `(connector, vendor, product, serial)`; `ApplyMonitorsConfig` expects
+    `(connector, mode id, properties)`. They are converted here; groups that
+    are already in that form pass through.
+    """
+    out = []
+    for c in mons:
+        mon = by_conn.get(c[0])
+        if not mon or is_virtual(mon):
+            continue
+        if len(c) == 3:
+            out.append(tuple(c))
+            continue
+        mode = current_mode(mon) or best_mode(mon)
+        if mode:
+            out.append((c[0], mode[0], {}))
+    return out
+
+
+# --- invariants -----------------------------------------------------------
+
+
+def mirrored(layout):
+    """Faulty groups: the virtual monitor shares a logical group (mirror).
+
+    The virtual monitor must always be in its own group; grouped with a
+    physical monitor, both show the same image and Sunshine captures the
+    physical one.
+    """
+    bad = []
+    for g in layout:
+        conns = [c[0] for c in g[5]]
+        if CONNECTOR in conns and len(conns) > 1:
+            bad.append(conns)
+    return bad
+
+
+def virtual_group(logical):
+    return next((g for g in logical if any(c[0] == CONNECTOR for c in g[5])), None)
+
+
+def real_groups(logical, monitors):
+    by_conn = {m[0][0]: m for m in monitors}
+    out = []
+    for g in logical:
+        conns = [c for c in g[5] if c[0] in by_conn and not is_virtual(by_conn[c[0]])]
+        if conns:
+            out.append((g, conns))
+    return out
+
+
+def extra_reals(monitors, logical):
+    """Physical monitors connected but off, to turn back on with their config."""
+    active = {c[0] for g in logical for c in g[5]}
+    stored = stored_defaults()
+    stored.update(load_prefs()["reals"])
+    out = []
+    for m in monitors:
+        conn = m[0][0]
+        if conn in active or is_virtual(m):
+            continue
+        d = stored.get(conn)
+        if not d or d.get("enabled") is False:
+            continue
+        mode = mode_for(m, d["mode"]) if d.get("mode") else best_mode(m)
+        if not mode:
+            continue
+        key = (d.get("x", 0), d.get("y", 0), d.get("scale", 1.0), d.get("transform", NORMAL))
+        same = next((g for g in out if g[:4] == key), None)
+        if same:  # same place, scale and rotation: a mirror, one group
+            same[5].append((conn, mode[0], {}))
+            continue
+        out.append((d.get("x", 0), d.get("y", 0), d.get("scale", 1.0), d.get("transform", NORMAL),
+                    bool(d.get("primary", False)), [(conn, mode[0], {})]))
+    return out
+
+
+# --- layouts --------------------------------------------------------------
+
+
+def base_layout(monitors, logical):
+    """Physical monitors only, virtual monitor off. None if already so.
+
+    The virtual connector stays plugged: no hotplug, so no re-enumeration and
+    no risk of losing a physical monitor (an unplug and replug cycle has
+    crashed gnome-shell, SEGV in libgvc.so). It just has no desktop area left:
+    the pointer can no longer drift off to the right into nothing.
+
+    Back from a stream, and for `base` and `boot` (RESTORE), the remembered
+    layout (`prefs.json`) is put back: it also repairs Mutter falling back to
+    its defaults after a hotplug. Outside streams the watcher keeps the live
+    layout (GNOME Settings) and only switches a leftover virtual monitor off.
+    """
+    by_conn = {m[0][0]: m for m in monitors}
+    prefs = load_prefs()["reals"]
+    extras = extra_reals(monitors, logical)
+    # Back from a stream the virtual monitor was primary: the remembered
+    # primary monitor gets the role back. Outside streams the live choice
+    # (GNOME Settings) is kept.
+    from_stream = virtual_group(logical) is not None or not real_groups(logical, monitors)
+    restore = RESTORE or from_stream
+    if not restore:
+        extras = []
+    layout, current = [], []
+    for group in list(logical) + list(extras):
+        conns = real_specs(group[5], by_conn)
+        if not conns:
+            continue
+        current.append((int(group[0]), int(group[1]), float(group[2]),
+                        int(group[3]), bool(group[4]), tuple(conns)))
+        entry = [int(group[0]), int(group[1]), float(group[2]),
+                 int(group[3]), bool(group[4]), tuple(conns)]
+        stored = prefs.get(conns[0][0]) if restore else None
+        if stored:
+            mon = by_conn.get(conns[0][0])
+            mode = mode_for(mon, stored.get("mode")) if mon else None
+            if mode:  # mirrored physical monitors stay in the group
+                entry[5] = ((conns[0][0], mode[0], {}),) + tuple(conns[1:])
+            entry[0] = int(stored.get("x", entry[0]))
+            entry[1] = int(stored.get("y", entry[1]))
+            entry[2] = float(stored.get("scale", entry[2]))
+            entry[3] = int(stored.get("transform", entry[3]))
+            if from_stream and "primary" in stored:
+                entry[4] = bool(stored["primary"])
+        layout.append(entry)
+    if not layout:
+        return None
+    seen = False
+    for e in layout:  # a single primary monitor, Mutter refuses several
+        if e[4] and seen:
+            e[4] = False
+        seen = seen or e[4]
+    shown = virtual_group(logical) is not None
+    desired = [tuple(e) for e in layout]
+    if not shown and not extras and desired == current:
+        return None
+    if not any(g[4] for g in desired):
+        first = desired[0]
+        desired[0] = (first[0], first[1], first[2], first[3], True, first[5])
+    return desired
+
+
+def preferred_mode(monitor):
+    return next((m for m in monitor[1] if m[6].get("is-preferred")), None) or best_mode(monitor)
+
+
+def remote_mode(monitor):
+    """The `remote` mode: native size at REMOTE_REFRESH, if it exists."""
+    pref = preferred_mode(monitor)
+    if not pref:
+        return None
+    m = mode_for(monitor, (pref[1], pref[2], REMOTE_REFRESH))
+    return m if m and abs(m[3] - REMOTE_REFRESH) < 0.6 else None
+
+
+def is_remote(monitor, mode):
+    """Is this mode the `remote` one (and not the preferred mode)?"""
+    dist, pref = remote_mode(monitor), preferred_mode(monitor)
+    return bool(mode and dist and mode[0] == dist[0] and dist[0] != pref[0])
+
+
+def solo_layout(monitors, logical, remote=False):
+    """The virtual monitor alone, primary: None if already so.
+
+    `remote`: at REMOTE_REFRESH (`remote` mode). Without `remote`, a virtual
+    monitor left at that rate goes back to its preferred mode (120 Hz, say).
+    """
+    vmon = next((m for m in monitors if m[0][0] == CONNECTOR), None)
+    if not vmon:
+        return None
+    current = current_mode(vmon)
+    vgroup = virtual_group(logical)
+    prefs = load_prefs()["virtual"]
+    transform = int(vgroup[3]) if vgroup else int(prefs["transform"])
+    scale = float(vgroup[2]) if vgroup else float(prefs["scale"])
+    if remote:
+        vmode = remote_mode(vmon)
+        if not vmode:
+            return None
+        done = bool(current) and current[0] == vmode[0]
+    else:
+        vmode = current if current and not is_remote(vmon, current) else preferred_mode(vmon)
+        if not vmode:
+            return None
+        done = not is_remote(vmon, current)
+    if (done and len(logical) == 1 and [c[0] for c in logical[0][5]] == [CONNECTOR]
+            and bool(logical[0][4])):
+        return None
+    return [(0, 0, scale, transform, True, [(CONNECTOR, vmode[0], {})])]
+
+
+def scale_supported(monitor_mode, scale):
+    """Does Mutter accept this scale for this mode?
+
+    It publishes the exact list of valid scales in its D-Bus state; that list
+    is used as is rather than recomputing its divisibility rule, which is not
+    obvious (1.25 works on 2400x1600, 1.5 does not).
+    """
+    try:
+        scales = monitor_mode[5]
+    except (IndexError, TypeError):
+        return False
+    if not scales:
+        return False
+    return any(abs(float(s) - float(scale)) < 1e-6 for s in scales)
+
+
+def fitting_scale(monitor_mode):
+    """Mutter's preferred scale for a mode, if it accepts it, else 1.0."""
+    preferred = float(monitor_mode[4] or 1.0)
+    return preferred if scale_supported(monitor_mode, preferred) else 1.0
+
+
+def build_layout(monitors, logical, extras=(), force_scale=None):
+    """Fixed extended layout, or None if Mutter's one is usable.
+
+    Real monitors are never changed (position, scale, rotation, primary). The
+    virtual monitor keeps its scale and rotation; its position is only fixed
+    when it overlaps a real monitor, is detached, or mirrors a real monitor.
+    `extras` holds physical monitors that are off and must be turned back on:
+    if there are any, a layout is always returned.
+    """
+    by_conn = {m[0][0]: m for m in monitors}
+    if not extras:
+        # Without this, from `only` mode (no real monitor shown), physical
+        # monitors that are off would never be turned back on.
+        extras = extra_reals(monitors, logical)
+
+    real = []
+    real_rects = []
+    prefs_reals = load_prefs()["reals"]
+    for group in list(logical) + list(extras):
+        x, y, scale, transform, primary = (int(group[0]), int(group[1]),
+                                           float(group[2]), int(group[3]),
+                                           bool(group[4]))
+        conns = real_specs(group[5], by_conn)
+        if not conns:
+            continue
+        # Remembered scale and rotation: if Mutter fell back to its defaults
+        # (reboot, new GPU), they are restored here too, not only in base mode.
+        stored = prefs_reals.get(conns[0][0])
+        if stored:
+            mon = by_conn.get(conns[0][0])
+            mode = mode_for(mon, stored.get("mode")) if mon else None
+            if mode:  # mirrored physical monitors stay in the group
+                conns = [(conns[0][0], mode[0], {})] + list(conns[1:])
+            x = int(stored.get("x", x))
+            y = int(stored.get("y", y))
+            scale = float(stored.get("scale", scale))
+            transform = int(stored.get("transform", transform))
+        entry = [x, y, scale, transform, primary, tuple(conns)]
+        real.append(entry)
+        real_rects.append(rect_of((x, y, scale, transform, primary, tuple(conns)),
+                                  monitors, conns))
+
+    vmon = by_conn.get(CONNECTOR)
+    if not vmon:
+        return None  # connector missing: nothing to place
+    vcur = current_mode(vmon)
+    stale = is_remote(vmon, vcur)  # left at REMOTE_REFRESH after `remote`
+    vmode_obj = vcur if vcur and not stale else preferred_mode(vmon)
+    if not vmode_obj:
+        return None
+    vmode = vmode_obj[0]
+
+    vgroup = virtual_group(logical)
+    # Virtual monitor off (base layout): reuse the remembered scale and
+    # rotation, otherwise every stream would start at the fallback scale.
+    prefs = load_prefs()["virtual"]
+    vscale = float(vgroup[2]) if vgroup else float(prefs["scale"])
+    # A freshly plugged connector comes up at Mutter's default scale (1.6667
+    # on a 2400x1600 panel, for example): that is not a choice. So the
+    # remembered scale wins as soon as it is valid for the current mode.
+    stored_scale = float(prefs.get("scale") or 0.0)
+    if stored_scale and scale_supported(vmode_obj, stored_scale):
+        vscale = stored_scale
+    if force_scale:
+        vscale = float(force_scale)
+    observed = bool(vgroup) and abs(float(vgroup[2]) - vscale) < 1e-6  # Mutter applied it
+    if not observed and vmode_obj[5] and not scale_supported(vmode_obj, vscale):
+        # New client resolution, or a scale Mutter refuses (it would reject the
+        # whole layout): Mutter's preferred scale for this mode.
+        vscale = fitting_scale(vmode_obj)
+    vtransform = int(vgroup[3]) if vgroup else int(prefs["transform"])
+    own_group = bool(vgroup) and len(vgroup[5]) == 1
+
+    vw, vh = (vmode_obj[2], vmode_obj[1]) if vtransform != NORMAL else (vmode_obj[1], vmode_obj[2])
+    vrect = (float(vgroup[0]), float(vgroup[1]), vw / vscale, vh / vscale) if vgroup else None
+
+    # During a stream the primary monitor must be the virtual one (the
+    # client's screen): it carries the top bar (GNOME only shows it on the
+    # primary monitor).
+    v_primary = bool(vgroup[4]) if vgroup else False
+    real_primary = any(g[4] for g in real)
+    wanted_primary = v_primary and not real_primary
+
+    if (own_group and vrect and not extras and force_scale is None and not stale
+            and wanted_primary and abs(float(vgroup[2]) - vscale) < 1e-6):
+        if not any(overlap(vrect, r) for r in real_rects) and (
+            not real_rects or any(touches(vrect, r) for r in real_rects)
+        ):
+            return None  # layout chosen by the user: leave it alone
+
+    layout = []
+    if real_rects:
+        # Anchor: the rightmost real monitor. The virtual monitor is glued to
+        # its right edge and centred vertically, so that the pointer crosses
+        # along the whole edge.
+        ax, ay, aw, ah = max(real_rects, key=lambda r: r[0] + r[2])
+        nx = int(round(ax + aw))
+        ny = int(round(ay + (ah - vh / vscale) / 2))
+    else:
+        nx, ny = 0, 0
+    if not real:
+        return [(nx, ny, vscale, vtransform, True, [(CONNECTOR, vmode, {})])]
+
+    for g in real:
+        g[4] = False
+    layout = [tuple(g) for g in real]
+    layout.append((nx, ny, vscale, vtransform, True, [(CONNECTOR, vmode, {})]))
+    return layout
+
+
+MODE_SIZE_RE = re.compile(r"^(\d+)x(\d+)")
+
+
+def group_size(group):
+    """Logical (width, height) of a layout group, from its mode ids
+    ("2400x1600@120.000"), or None if a mode id cannot be read."""
+    w = h = 0
+    for c in group[5]:
+        m = MODE_SIZE_RE.match(str(c[1]))
+        if not m:
+            return None
+        mw, mh = int(m[1]), int(m[2])
+        if int(group[3]) % 2:
+            mw, mh = mh, mw
+        w, h = max(w, mw), max(h, mh)
+    scale = float(group[2]) or 1.0
+    return w / scale, h / scale
+
+
+def fit_layout(layout):
+    """The same layout, made acceptable to Mutter.
+
+    Mutter refuses a layout whose monitors overlap, are not all connected
+    through shared edges, or do not start at x=0 and y=0 ("Logical monitors
+    positions are offset"). That happens on its own: the virtual monitor
+    centred next to a monitor that is less tall goes above y=0, a monitor
+    unplugged leaves a gap, a new scale or rotation makes a monitor wider.
+
+    A layout that only has an offset is just shifted to (0, 0). Otherwise the
+    monitors connected to the primary one (or to the first one) keep their
+    place, and each monitor that overlaps or is cut off is put against the
+    right edge of the placed ones, in the left-to-right order of the layout.
+    """
+    groups = [list(g) for g in layout]
+    sizes = [group_size(g) for g in groups]
+    if not groups or any(sz is None for sz in sizes):
+        return [tuple(g) for g in groups]
+    rects = [(float(g[0]), float(g[1]), w, h) for g, (w, h) in zip(groups, sizes)]
+    if not layout_problems(rects):
+        return _shifted(groups)
+    # Keep the component of the primary monitor, minus monitors that overlap it.
+    start = next((i for i, g in enumerate(groups) if g[4]), 0)
+    keep = {start}
+    frontier = [start]
+    while frontier:
+        i = frontier.pop()
+        for j, r in enumerate(rects):
+            if j not in keep and touches(rects[i], r) and not any(
+                    overlap(r, rects[k]) for k in keep):
+                keep.add(j)
+                frontier.append(j)
+    placed = [rects[i] for i in sorted(keep)]
+    for i in sorted(set(range(len(groups))) - keep, key=lambda i: (rects[i][0], rects[i][1])):
+        x, y, w, h = rects[i]
+        anchor = max(placed, key=lambda p: (p[0] + p[2], -abs(p[1] - y)))
+        if min(y + h, anchor[1] + anchor[3]) - max(y, anchor[1]) <= 1:
+            y = anchor[1]
+        r = (anchor[0] + anchor[2], y, w, h)
+        groups[i][0], groups[i][1] = r[0], r[1]
+        placed.append(r)
+    return _shifted(groups)
+
+
+def layout_problems(rects):
+    """What Mutter would object to in these logical rectangles ([] if nothing)."""
+    problems = []
+    if any(overlap(a, b) for i, a in enumerate(rects) for b in rects[i + 1:]):
+        problems.append("overlap")
+    if len(rects) > 1:
+        seen, frontier = {0}, [0]
+        while frontier:
+            i = frontier.pop()
+            for j, r in enumerate(rects):
+                if j not in seen and touches(rects[i], r):
+                    seen.add(j)
+                    frontier.append(j)
+        if len(seen) < len(rects):
+            problems.append("not adjacent")
+    return problems
+
+
+def _shifted(groups):
+    dx = min(float(g[0]) for g in groups)
+    dy = min(float(g[1]) for g in groups)
+    for g in groups:
+        g[0] = int(round(float(g[0]) - dx))
+        g[1] = int(round(float(g[1]) - dy))
+    return [tuple(g) for g in groups]
+
+
+def apply(serial, layout):
+    """Applies a layout.
+
+    Method 1 = temporary: Mutter applies it and forgets it on the next reload
+    (this tool writes monitors.xml itself). Never method 2 (persistent): it
+    triggers the "Keep these settings?" prompt, and Mutter reverts everything
+    after 20 seconds when nobody answers.
+    """
+    bad = mirrored(layout)
+    if bad:
+        raise SystemExit(f"layout refused (mirrors {CONNECTOR}): {bad}")
+    layout = fit_layout(layout)
+    arg = GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                       (serial, 1, [tuple(g) for g in layout], {}))
+    mutter_call("ApplyMonitorsConfig", arg)
+
+
+def describe(logical):
+    return sorted([sorted(c[0] for c in g[5]) for g in logical])
+
+
+def converge(mode, tries=5, delay=1.0):
+    """Applies the mode until Mutter sticks to it.
+
+    Mutter sometimes restores its saved configuration one or two seconds after
+    a hotplug: reapply until there is nothing left to fix. Returns the final
+    state (monitors, logical).
+    """
+    monitors = logical = None
+    last_error = None
+    for _ in range(tries):
+        serial, monitors, logical = state()
+        if mode == "base":
+            layout = base_layout(monitors, logical)
+        elif mode == "only":
+            layout = solo_layout(monitors, logical)
+        elif mode == "remote":
+            layout = solo_layout(monitors, logical, remote=True)
+        else:
+            layout = build_layout(monitors, logical, extra_reals(monitors, logical))
+        if layout is None:
+            return monitors, logical
+        try:
+            apply(serial, layout)
+        except GLib.Error as e:
+            # Mutter refuses a config built on an outdated state ("stale
+            # information") while it reconfigures right after a hotplug: the
+            # state is read again on the next round.
+            last_error = e
+        time.sleep(delay)
+    _serial, monitors, logical = state()
+    if last_error is not None and settled(mode, monitors, logical):
+        raise last_error
+    return monitors, logical
+
+
+# --- persistence ----------------------------------------------------------
+
+
+def monitor_key(spec):
+    """(connector, vendor, product, serial): how Mutter identifies a monitor."""
+    return tuple(str(x) for x in spec[:4])
+
+
+def xml_monitor_set(configuration):
+    """Monitors named by a <configuration> of monitors.xml, disabled ones included,
+    identified like Mutter does (connector, vendor, product, serial)."""
+    return frozenset((spec.findtext("connector") or "", spec.findtext("vendor") or "",
+                      spec.findtext("product") or "", spec.findtext("serial") or "")
+                     for spec in configuration.iter("monitorspec"))
+
+
+def snapshot_xml(monitors, logical):
+    """Saves the current layout to ~/.config/monitors.xml.
+
+    Mutter does not persist what is applied over D-Bus (method 1). Without an
+    up-to-date file, it restores an old configuration when the shell restarts
+    or after a hotplug, which brings mirrored layouts back. A single block is
+    written, the real state, followed by the physical monitors that are
+    connected but disabled.
+
+    The virtual monitor NEVER appears in it. It only exists once its EDID is
+    injected, long after Mutter starts: a configuration that mentions it can
+    never match the boot state, and Mutter replaces it with its defaults (the
+    physical monitors then lose their rotation on every boot). So the file
+    only describes physical monitors; the tool adds the virtual one
+    afterwards, in memory.
+
+    Does nothing if the current layout is inconsistent (mirror): better keep
+    the old file than save a faulty state.
+    """
+    if mirrored(logical):
+        return False
+    by_conn = {m[0][0]: m for m in monitors}
+    root = ET.Element("monitors", version="2")
+    config = ET.SubElement(root, "configuration")
+    ET.SubElement(config, "layoutmode").text = "logical"
+
+    physical = []
+    streaming = virtual_group(logical) is not None
+    for g in logical:
+        conns = [c for c in g[5]
+                 if by_conn.get(c[0]) and not is_virtual(by_conn[c[0]])]
+        if conns:
+            physical.append((g[0], g[1], g[2], g[3], g[4], conns))
+    if streaming and physical:
+        # The physical monitors were moved for the virtual one and lost the
+        # primary role: the file must hold their own layout, as remembered.
+        reals = load_prefs()["reals"]
+        kept = []
+        for g in physical:
+            d = reals.get(g[5][0][0])
+            kept.append((d.get("x", g[0]), d.get("y", g[1]), g[2], g[3],
+                         bool(d.get("primary", False)), g[5]) if d else g)
+        physical = kept
+    if not physical:
+        # `only` mode: only the virtual monitor is on. Keep the base physical
+        # configuration, the one Mutter must find again.
+        for conn, d in load_prefs()["reals"].items():
+            mon = by_conn.get(conn)
+            if not mon or d.get("enabled") is False:
+                continue
+            mode = mode_for(mon, d.get("mode")) if d.get("mode") else best_mode(mon)
+            if not mode:
+                continue
+            physical.append((d.get("x", 0), d.get("y", 0), d.get("scale", 1.0),
+                             d.get("transform", 0), bool(d.get("primary", False)),
+                             [(conn, mode[0], {})]))
+    if physical and layout_problems([rect_of(g, monitors, list(g[5])) for g in physical]):
+        # Mutter ignores the WHOLE file when one configuration is invalid
+        # (meta_verify_monitors_config): keep the old file rather than that.
+        return False
+    seen = False
+    for i, g in enumerate(physical):  # Mutter refuses a file with several primaries
+        if g[4] and seen:
+            physical[i] = (g[0], g[1], g[2], g[3], False, g[5])
+        seen = seen or bool(g[4])
+    if physical and not any(bool(g[4]) for g in physical):
+        x, y, scale, transform, _p, mons = physical[0]
+        physical[0] = (x, y, scale, transform, True, mons)
+
+    shown = set()
+    for g in physical:
+        x, y, scale, transform, primary, mons = g[0], g[1], g[2], g[3], g[4], g[5]
+        lm = ET.SubElement(config, "logicalmonitor")
+        ET.SubElement(lm, "x").text = str(int(x))
+        ET.SubElement(lm, "y").text = str(int(y))
+        ET.SubElement(lm, "scale").text = repr(float(scale))
+        ET.SubElement(lm, "primary").text = "yes" if primary else "no"
+        for c in mons:  # one <monitor> per monitor of the group (mirrors)
+            mon = by_conn.get(c[0])
+            if not mon:
+                continue
+            shown.add(c[0])
+            node = ET.SubElement(lm, "monitor")
+            spec = ET.SubElement(node, "monitorspec")
+            ET.SubElement(spec, "connector").text = mon[0][0]
+            ET.SubElement(spec, "vendor").text = mon[0][1]
+            ET.SubElement(spec, "product").text = mon[0][2]
+            ET.SubElement(spec, "serial").text = mon[0][3]
+            mode = mode_by_id(mon, c[1]) or current_mode(mon) or best_mode(mon)
+            if mode:
+                mn = ET.SubElement(node, "mode")
+                ET.SubElement(mn, "width").text = str(mode[1])
+                ET.SubElement(mn, "height").text = str(mode[2])
+                ET.SubElement(mn, "rate").text = f"{mode[3]:.3f}"
+        if transform != NORMAL:
+            tr = ET.SubElement(lm, "transform")
+            ET.SubElement(tr, "rotation").text = ROTATION_NAMES.get(transform % 4, "normal")
+            ET.SubElement(tr, "flipped").text = "no"
+
+    for m in monitors:
+        if m[0][0] in shown or is_virtual(m):
+            # The virtual monitor is not listed as <disabled> either: Mutter
+            # keys its configurations on the whole set of monitors listed,
+            # disabled ones included (`meta_monitors_config_key_new`). An entry
+            # for it would make the configuration impossible to match at boot.
+            continue
+        dis = ET.SubElement(config, "disabled")
+        spec = ET.SubElement(dis, "monitorspec")
+        ET.SubElement(spec, "connector").text = m[0][0]
+        ET.SubElement(spec, "vendor").text = m[0][1]
+        ET.SubElement(spec, "product").text = m[0][2]
+        ET.SubElement(spec, "serial").text = m[0][3]
+
+    # Keep the configurations of other monitor sets (a laptop's docked and
+    # undocked profiles): only the one for this set of monitors is replaced.
+    ours = xml_monitor_set(config)
+    try:
+        for other in ET.parse(MONITORS_XML).getroot().findall("configuration"):
+            if xml_monitor_set(other) != ours:
+                root.append(other)
+    except (OSError, ET.ParseError):
+        pass
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    try:
+        if os.path.exists(MONITORS_XML):
+            with open(MONITORS_XML, "rb") as f:
+                old = f.read()
+            if old == ET.tostring(root, encoding="UTF-8"):
+                remember_xml(old)  # repairs a stale fingerprint
+                return False
+            with open(MONITORS_XML + ".bak", "wb") as f:
+                f.write(old)
+        tmp = MONITORS_XML + ".tmp"
+        tree.write(tmp, encoding="UTF-8", xml_declaration=False)
+        with open(tmp, "rb") as f:
+            written = f.read()
+        os.replace(tmp, MONITORS_XML)
+        remember_xml(written)
+    except OSError:
+        return False
+    return True
+
+
+def remember_xml(data):
+    """Records the fingerprint of the monitors.xml this tool wrote (see settings_disabled)."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(XML_WRITTEN, "w") as f:
+            f.write(hashlib.sha256(data).hexdigest() + "\n")
+    except OSError:
+        pass
+
+
+# --- hardware -------------------------------------------------------------
+
+
+def helper(action, *args):
+    r = subprocess.run(["sudo", "-n", HELPER, action, KERNEL_CONNECTOR, *args],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit((r.stderr or r.stdout).strip() or f"{action}: failed")
+    return r.stdout.strip()
+
+
+def present():
+    """Is the virtual connector connected (even disabled)?"""
+    try:
+        _serial, monitors, _logical = state()
+    except SessionUnreachable:
+        # Never "absent": ensure_virtual would then hotplug the connector on a
+        # frozen desktop.
+        raise
+    return any(x[0][0] == CONNECTOR for x in monitors)
+
+
+def active():
+    """Is the virtual connector shown (does it have a current mode)?"""
+    try:
+        _serial, monitors, _logical = state()
+    except SessionUnreachable:
+        raise
+    m = next((x for x in monitors if x[0][0] == CONNECTOR), None)
+    return bool(m and current_mode(m))
+
+
+def settle(timeout=8.0, stable=1.4):
+    """Waits until Mutter has finished restoring its config after a hotplug."""
+    start = time.time()
+    last, since = object(), time.time()
+    while time.time() - start < timeout:
+        serial, monitors, logical = state()
+        vg = virtual_group(logical)
+        cur = (vg[0], vg[1], round(float(vg[2]), 4)) if vg else None
+        if cur != last:
+            last, since = cur, time.time()
+        elif cur is not None and time.time() - since >= stable:
+            break
+        time.sleep(0.3)
+    return state()
+
+
+def client_request(mode):
+    """(width, height, refresh) the Moonlight client asked for, or None.
+
+    Sunshine passes them to the app commands. `remote` keeps remote_refresh:
+    a 30 fps client is fine with a 60 Hz monitor."""
+    try:
+        width = int(os.environ["SUNSHINE_CLIENT_WIDTH"])
+        height = int(os.environ["SUNSHINE_CLIENT_HEIGHT"])
+        fps = int(os.environ.get("SUNSHINE_CLIENT_FPS") or 60)
+    except (KeyError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    refresh = REMOTE_REFRESH if mode == "remote" else float(fps if fps > 0 else 60)
+    return width, height, refresh
+
+
+def edid_offers(edid, width, height, refresh):
+    return bool(edid) and any(w == width and h == height and abs(r - refresh) < 0.5
+                              for w, h, r in edid.modes)
+
+
+def reload_edid():
+    global VIRTUAL_PRODUCT, VIRTUAL_NATIVE
+    edid = read_edid(EDID_PATH)
+    VIRTUAL_PRODUCT = edid.product if edid else None
+    VIRTUAL_NATIVE = (edid.width, edid.height) if edid and edid.width and edid.height else None
+
+
+def wait_for_mode(width, height, refresh, wait=15):
+    """Waits until Mutter lists the new mode on the virtual connector."""
+    deadline = time.time() + wait
+    while True:
+        _serial, monitors, _logical = state()
+        vmon = next((m for m in monitors if m[0][0] == CONNECTOR), None)
+        if vmon and any(m[1] == width and m[2] == height and abs(m[3] - refresh) < 0.5
+                        for m in vmon[1]):
+            break
+        if time.time() > deadline:
+            raise SystemExit(f"Mutter does not show {width}x{height}@{refresh:g} on {CONNECTOR}")
+        time.sleep(0.3)
+    settle()
+
+
+def match_client_mode(mode):
+    """match_client: gives the virtual monitor the client's mode before a stream.
+
+    Nothing happens when the current EDID already offers it (the common case:
+    the same client again). Above the EDID 1.4 pixel clock limit (3840x2160
+    tops out near 74 Hz), the client's resolution is used at 60 Hz. Returns
+    True when a new EDID was injected.
+    """
+    if not MATCH_CLIENT:
+        return False
+    wanted = client_request(mode)
+    if not wanted:
+        return False
+    width, height, refresh = wanted
+    rate = int(round(refresh))
+    if edid_offers(read_edid(EDID_PATH), width, height, rate):
+        return False
+    # The second try is a 60 Hz-only EDID with its own CVT pixel clock: when the
+    # driver dropped the fast mode for its clock, a 60 Hz mode stretched from it
+    # (same clock) would be dropped too.
+    for rate in dict.fromkeys((rate, 60)):
+        try:
+            helper("on", f"{width}x{height}@{rate}")
+            reload_edid()
+            wait_for_mode(width, height, rate)
+        except SystemExit as e:
+            journal(f"match_client: {width}x{height}@{rate} refused: {e}")
+            continue
+        journal(f"match_client: virtual monitor set to {width}x{height}@{rate}")
+        return True
+    return False
+
+
+def ensure_virtual(wait=15):
+    """Creates the virtual connector if it does not exist yet."""
+    if present():
+        return
+    helper("on")
+    deadline = time.time() + wait
+    while not present():
+        if time.time() > deadline:
+            raise SystemExit("The virtual connector does not show up in Mutter")
+        time.sleep(0.5)
+    settle()
+
+
+# --- Sunshine -------------------------------------------------------------
+
+
+def log_tail(size=400_000):
+    try:
+        with open(SUNSHINE_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - size))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return last_run(sunshine_journal())
+
+
+def last_run(journal_text):
+    """The part of Sunshine's journal since its last start (a log file is
+    emptied at each start, the journal is not)."""
+    if not journal_text:
+        return journal_text
+    cut = max(journal_text.rfind("\nStarted "), journal_text.rfind("\nStarting "))
+    if journal_text.startswith(("Started ", "Starting ")) and cut < 0:
+        cut = 0
+    return journal_text[cut + 1:] if cut > 0 else journal_text
+
+
+def sunshine_journal(lines=4000):
+    """Sunshine's output from the journal, when its log file is not where the
+    config says (Flatpak, custom log_path). None if that fails too."""
+    try:
+        r = subprocess.run(["journalctl", "--user", "-u", SUNSHINE_UNIT, "-n", str(lines),
+                            "-o", "cat", "--no-pager"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout.strip() else None
+
+
+def stream_open():
+    """Is a Moonlight session open?
+
+    Sunshine writes "New streaming session started", then "CLIENT
+    DISCONNECTED" at the end, however the client leaves; "<ip>: Ping Timeout"
+    when the client dies without notice.
+    """
+    tail = log_tail()
+    if tail is None:
+        return True  # when in doubt, break nothing
+    return open_sessions(tail) > 0
+
+
+SESSIONS_RE = re.compile(r"New streaming session started \[active sessions: (\d+)\]")
+
+
+def open_sessions(tail):
+    """Number of Moonlight sessions still open at the end of the log.
+
+    A client that reconnects before its old session timed out gives two
+    sessions ("active sessions: 2"): the old one's "Ping Timeout" then comes
+    last while the new one runs. Ends Sunshine logs: CLIENT DISCONNECTED,
+    "<ip>: Ping Timeout", and "Executing Undo Cmd" alone on a Quit.
+    """
+    n = 0
+    for line in tail.splitlines():
+        m = SESSIONS_RE.search(line)
+        if m:
+            n = int(m[1])
+        elif "CLIENT CONNECTED" in line:
+            n = max(n, 1)
+        elif "CLIENT DISCONNECTED" in line or ": Ping Timeout" in line:
+            n = max(n - 1, 0)
+        elif ("Executing Undo Cmd" in line or "Terminate handler called" in line
+              or line.startswith("Started ") or line.startswith("Stopped ")):
+            n = 0
+    return n
+
+
+def app_engaged():
+    """Is our app still "running" for Sunshine?
+
+    The apps only have a `detached` command: for Sunshine the app runs until
+    the client quits it ("Executing Undo Cmd"). Until then, a new click on its
+    tile resumes it, without `prep`.
+    """
+    tail = log_tail()
+    if tail is None:
+        return False
+    pos = tail.rfind("Executing Do Cmd")
+    if pos < 0:
+        return False
+    if PROG not in tail[pos:tail.find("\n", pos)]:
+        return False
+    return tail.rfind("Executing Undo Cmd") < pos
+
+
+def session_end(tail):
+    """Position of the last end of session in the log.
+
+    When the client quits the app (`quit`, `--quit-after`), Sunshine runs the
+    `undo` and closes the sessions without always writing "CLIENT
+    DISCONNECTED" (seen with two sessions open): the `undo` counts as an end
+    too.
+    """
+    return max(tail.rfind("CLIENT DISCONNECTED"), tail.rfind(": Ping Timeout"),
+               tail.rfind("Executing Undo Cmd"))
+
+
+def captured_wrong_screen():
+    """Did Sunshine stream another monitor than the virtual one in the last session?
+
+    That is the symptom of a stuck app: on the next stream Sunshine skips the
+    `prep-cmd` and streams the physical monitor. Only this case justifies
+    restarting it; otherwise a restart would needlessly break a healthy setup.
+    """
+    tail = log_tail()
+    if tail is None:
+        return False
+    start = max(tail.rfind("New streaming session started"),
+                tail.rfind("CLIENT CONNECTED"))
+    end = max(tail.rfind("CLIENT DISCONNECTED"), tail.rfind(": Ping Timeout"),
+              tail.rfind("Executing Undo Cmd"))
+    if start < 0:
+        return False
+    if end < start:
+        return False  # session still running: no verdict
+    # Sunshine writes "Executing Do Cmd" BEFORE "New streaming session
+    # started": so look just before the start of the session, from the end of
+    # the previous one.
+    prev_end = 0
+    for marker in ("CLIENT DISCONNECTED", ": Ping Timeout", "Executing Undo Cmd"):
+        idx = tail.rfind(marker, 0, start)
+        prev_end = max(prev_end, idx if idx >= 0 else 0)
+    if tail.rfind("Executing Do Cmd", prev_end, start) < prev_end:
+        # "Desktop" stream (no app chosen): streaming the physical monitor is normal.
+        return False
+    segment = tail[start:end]
+    mapped = segment.rfind("Mapped '")
+    if mapped < 0:
+        return False
+    # Sunshine's KMS capture names connectors like the kernel (HDMI-A-1).
+    return not segment[mapped:].startswith("Mapped '" + KERNEL_CONNECTOR + "'")
+
+
+def idle_for():
+    """For how many seconds no session has been open.
+
+    The timestamp of the last end line in Sunshine's log is read, rather than
+    counting from the watcher's last pass: detection then no longer depends on
+    the watch period.
+    """
+    tail = log_tail()
+    if tail is None:
+        return None
+    start = max(tail.rfind("New streaming session started"),
+                tail.rfind("CLIENT CONNECTED"))
+    end = session_end(tail)
+    if start > end:
+        return 0.0  # session running
+    if end < 0:
+        if start < 0:
+            return None  # fresh log: nothing usable
+        return 0.0
+    chunk = tail[max(0, tail.rfind("\n", 0, end) + 1):end]
+    try:
+        stamp = datetime.strptime(chunk[1:24], "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:
+        return None
+    return max(0.0, (datetime.now() - stamp).total_seconds())
+
+
+def wait_running():
+    """Is a `gnome-virtual-display wait` running (Sunshine app engaged)?
+
+    Between the `prep-cmd` and the client connecting, the log shows no
+    session start yet. Without this guard the watcher concluded "no more
+    session" and restored base right then: the virtual monitor turned off
+    before the capture started and Sunshine streamed the physical monitor.
+    """
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        for i, arg in enumerate(args[:-1]):
+            if os.path.basename(arg) == PROG and args[i + 1] == "wait":
+                return True
+    return False
+
+
+def sunshine_stuck():
+    """Did Sunshine keep an app "running" after an abrupt end?
+
+    When the client disappears without `/cancel` (network cut, window killed),
+    Sunshine never frees the app: on the next stream it skips the `prep-cmd`
+    and streams the physical monitor. Signature in the log: the current
+    session started without "Executing Do Cmd", while an app had been launched
+    and no "Executing Undo Cmd" came to free it. A "Desktop" stream runs no Do
+    Cmd: it is never affected.
+    """
+    tail = log_tail()
+    if tail is None:
+        return False
+    last_do = tail.rfind("Executing Do Cmd")
+    if last_do < 0:
+        return False
+    if tail.rfind("Executing Undo Cmd", last_do) > last_do:
+        return False  # app freed cleanly
+    start = max(tail.rfind("New streaming session started"),
+                tail.rfind("CLIENT CONNECTED"))
+    if start < 0:
+        return False
+    prev_end = 0
+    for marker in ("CLIENT DISCONNECTED", ": Ping Timeout", "Executing Undo Cmd"):
+        idx = tail.rfind(marker, 0, start)
+        prev_end = max(prev_end, idx if idx >= 0 else 0)
+    return tail.rfind("Executing Do Cmd", prev_end, start) < prev_end
+
+
+def stuck_own_app():
+    """Is the app left open ours (`gnome-virtual-display prep`)?
+
+    An app left open is not necessarily a problem: if the client then asks for
+    the "Desktop" entry, the session is legitimate and streams the physical
+    monitor. But when the pending app is ours, a session that starts without
+    it is necessarily on the wrong monitor: the client has no other way than
+    to launch it again.
+    """
+    tail = log_tail()
+    if tail is None:
+        return False
+    pos = tail.rfind("Executing Do Cmd")
+    if pos < 0:
+        return False
+    line = tail[pos:tail.find("\n", pos)]
+    if PROG not in line:
+        return False
+    return sunshine_stuck()
+
+
+def sunshine_lacks_wayland():
+    """Is Sunshine running without WAYLAND_DISPLAY while the session has one?"""
+    r = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value", SUNSHINE_UNIT],
+                       capture_output=True, text=True)
+    pid = r.stdout.strip()
+    if not pid.isdigit() or pid == "0":
+        return False
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = f.read().split(b"\0")
+    except OSError:
+        return False
+    if any(v.startswith(b"WAYLAND_DISPLAY=") for v in env):
+        return False
+    r = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, text=True)
+    return "WAYLAND_DISPLAY=" in r.stdout
+
+
+def restart_sunshine():
+    subprocess.run(["systemctl", "--user", "reset-failed", SUNSHINE_UNIT],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "--user", "restart", SUNSHINE_UNIT],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- commands -------------------------------------------------------------
+
+
+def cmd_list():
+    _serial, monitors, logical = state()
+    for m in monitors:
+        cur = current_mode(m)
+        desc = f"{cur[1]}x{cur[2]}@{round(cur[3], 2)}" if cur else "inactive"
+        tag = " [virtual]" if is_virtual(m) else ""
+        print(f"  {m[0][0]:<12} {desc:<18}{tag}")
+    print("desktop:")
+    for x, y, scale, transform, primary, mons, _p in logical:
+        rot = ROTATION_NAMES.get(int(transform), "?")
+        print(f"  ({x},{y}) scale={round(scale, 4)} rot={rot} primary={bool(primary)} -> "
+              f"{', '.join(c[0] for c in mons)}")
+    return 0
+
+
+def settled(mode, monitors, logical):
+    """Does the state really match the requested mode? None if it does,
+    else the reason."""
+    if mirrored(logical):
+        return f"the desktop is mirrored: {describe(logical)}"
+    if mode == "base":
+        if not any(not is_virtual(m) for m in monitors):
+            # No physical monitor connected (a portable monitor unplugged, for
+            # example): the virtual monitor stays the only one, and the session
+            # stays reachable over Moonlight.
+            return None
+        if virtual_group(logical):
+            return "the virtual monitor is still on"
+        if not real_groups(logical, monitors):
+            return "no physical monitor is on"
+    elif mode in ("only", "remote"):
+        groups = describe(logical)
+        if groups != [[CONNECTOR]]:
+            return f"monitors shown: {groups}"
+        vmon = next((m for m in monitors if m[0][0] == CONNECTOR), None)
+        cur = current_mode(vmon) if vmon else None
+        if mode == "remote" and not (cur and abs(cur[3] - REMOTE_REFRESH) < 0.6):
+            return f"the virtual monitor is not at {REMOTE_REFRESH:.0f} Hz"
+    elif not active():
+        return "the virtual monitor is not on"
+    else:
+        vg = virtual_group(logical)
+        if vg and not bool(vg[4]):
+            return "the virtual monitor is not primary"
+        if any(bool(g[4]) for g, _c in real_groups(logical, monitors)):
+            return "a physical monitor is still primary"
+    return None
+
+
+def gsettings(*args):
+    """`gsettings` with a timeout (None if unavailable)."""
+    try:
+        r = subprocess.run(["gsettings", *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def flatten_mouse():
+    """Flat acceleration profile during a stream (`flat_mouse_during_stream`).
+
+    Moonlight can send pointer motion already accelerated by the client's own
+    touchpad (SDL_MOUSE_RELATIVE_SYSTEM_SCALE=1 in the client's environment):
+    the host must not accelerate it a second time with its mouse curve, or the
+    pointer does not move at the client's speed. GNOME only sets acceleration
+    for all mice at once: it is changed for the time of the stream, and the
+    previous setting is restored afterwards (for the host's local mice).
+    """
+    if not FLAT_MOUSE:
+        return
+    cur = gsettings("get", MOUSE_SCHEMA, "accel-profile")
+    if not cur:
+        return
+    cur = cur.strip("'")
+    if not os.path.exists(MOUSE_FILE):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(MOUSE_FILE, "w") as f:
+                f.write(cur)
+        except OSError:
+            return
+    if cur != "flat":
+        gsettings("set", MOUSE_SCHEMA, "accel-profile", "flat")
+
+
+def restore_mouse():
+    """Restores the acceleration profile from before the stream."""
+    try:
+        with open(MOUSE_FILE) as f:
+            saved = f.read().strip()
+    except OSError:
+        return
+    if saved in ("default", "flat", "adaptive"):
+        gsettings("set", MOUSE_SCHEMA, "accel-profile", saved)
+    try:
+        os.unlink(MOUSE_FILE)
+    except OSError:
+        pass
+
+
+def command(mode, before=None):
+    """Applies a mode cleanly: convergence, check, persistence."""
+    if mode == "base":
+        clear_session()
+    previous = read_mode()
+    write_mode(mode)
+    try:
+        if before:
+            before()
+        monitors, logical = converge(mode)
+        reason = settled(mode, monitors, logical)
+        if reason:
+            raise SystemExit(f"{mode}: {reason}")
+        save_prefs(monitors, logical)
+        snapshot_xml(monitors, logical)
+    except BaseException:
+        write_mode(previous)
+        raise
+    if mode == "base":
+        restore_mouse()
+    else:
+        flatten_mouse()
+    return cmd_list()
+
+
+def cmd_base():
+    """Base layout: physical monitors only, virtual monitor off.
+
+    Run by Sunshine's undo and at the end of `wait`: the physical monitors get
+    their remembered layout back (position, scale, rotation, primary).
+    """
+    global RESTORE
+    RESTORE = True
+    try:
+        return command("base")
+    finally:
+        RESTORE = False
+
+
+def cmd_extend():
+    """Extended desktop: all physical monitors on, virtual monitor on the right."""
+    return command("extend", ensure_virtual)
+
+
+def cmd_only():
+    """The virtual monitor alone: the physical monitors are off."""
+    return command("only", ensure_virtual)
+
+
+def cmd_remote():
+    """The virtual monitor alone at REMOTE_REFRESH (`remote` entries)."""
+    return command("remote", ensure_virtual)
+
+
+def cmd_wait(mode="extend"):
+    """Main command of the Sunshine app: applies MODE, then waits.
+
+    Sunshine runs this command on every stream, after the `prep-cmd`. While it
+    runs, Sunshine considers the app launched. As soon as the session ends,
+    cleanly or not, with or without `/cancel`, it restores the base layout and
+    exits, which frees the app for the next stream. Without it, Sunshine
+    stayed stuck with the app running when the client closed its window
+    without `/cancel`: it then skipped the `prep-cmd` and captured the
+    physical monitor.
+    """
+    mode = normalize_mode(mode)
+    # The most recent stream wins: each `wait` records its token and backs off
+    # as soon as a newer `prep` replaced it (otherwise the older `wait` would
+    # restore base under the new stream).
+    token = mark_session()
+    guard = lock()
+    try:
+        if mode == "only":
+            cmd_only()
+        elif mode == "remote":
+            cmd_remote()
+        else:
+            cmd_extend()
+    finally:
+        unlock(guard)
+
+    # Wait for the end of the session: three negative reads in a row (~6 s),
+    # so as not to react to a rotation of Sunshine's log. Clean end (the client
+    # quit the app, Sunshine ran the `undo`): base at once. Abrupt end: keep
+    # the stream layout for GRACE seconds, long enough for a resume, then base
+    # and a Sunshine restart to free the app.
+    closed, ended, release = 0, None, False
+    while True:
+        time.sleep(2)
+        if session_token() != token:
+            print("a newer stream took over", flush=True)
+            return 0
+        if stream_open():
+            closed, ended = 0, None
+            continue
+        closed += 1
+        if closed < 3:
+            continue
+        ended = ended or time.time()
+        if not app_engaged():
+            break
+        if time.time() - ended >= GRACE:
+            release = True
+            break
+
+    guard = lock()
+    try:
+        if session_token() != token:
+            return 0
+        print("session ended: base layout", flush=True)
+        cmd_base()
+        if release and app_engaged() and not stream_open():
+            print(f"no resume within {GRACE} s: Sunshine restarted to free the app", flush=True)
+            journal(f"wait: no resume within {GRACE} s, Sunshine restarted to free the app")
+            restart_sunshine()
+    finally:
+        unlock(guard)
+    return 0
+
+
+def cmd_reapply():
+    """Reapplies the current mode (called when Sunshine starts).
+
+    Never changes the mode: it reads `mode` and restores it. Never exits with
+    an error, so as not to keep Sunshine from starting.
+    """
+    guard = lock(wait=False)
+    if guard is None:
+        return 0  # another command holds the lock
+    try:
+        mode = read_mode()
+        if mode == "extend":
+            ensure_virtual()
+        monitors, logical = converge(mode, tries=3, delay=0.8)
+        save_prefs(monitors, logical)
+        snapshot_xml(monitors, logical)
+    except BaseException as e:
+        print(f"reapply: {e}", file=sys.stderr)
+    finally:
+        unlock(guard)
+    return 0
+
+
+def cmd_prep(mode="extend"):
+    """Sunshine `prep-cmd`: claims the session, then applies the mode.
+
+    Like `extend` and `only`, it plugs the virtual connector if it does not
+    exist yet. After a reboot the connector is gone (its EDID is injected on
+    demand and does not survive a boot): without plugging it, the mode cannot
+    be applied and Sunshine refuses to launch the app ("failed to start" in
+    Moonlight).
+    """
+    mode = normalize_mode(mode)
+    mark_session()
+    target = mode if mode in ("only", "remote") else "extend"
+
+    def before():
+        match_client_mode(target)
+        ensure_virtual()
+    try:
+        return command(target, before)
+    except NoSession:
+        raise  # login screen: the stream starts anyway (see run)
+    except BaseException:
+        clear_session()
+        raise
+
+
+def apply_scale(connector, scale):
+    """Forces a scale on a monitor (virtual or physical) and remembers it.
+
+    Changing a monitor's scale moves its logical edges: Mutter refuses a
+    layout that is no longer adjacent. For a physical monitor the virtual one
+    is therefore briefly turned off, the scale applied, then the mode
+    restored: `build_layout` then puts the virtual monitor back on the right,
+    centred.
+    """
+    mode = read_mode()
+    if connector == CONNECTOR:
+        for _ in range(4):
+            serial, monitors, logical = state()
+            if mode in ("only", "remote"):
+                vmon = next((m for m in monitors if m[0][0] == CONNECTOR), None)
+                vmode = current_mode(vmon) or best_mode(vmon) if vmon else None
+                if not vmode:
+                    return False
+                group = virtual_group(logical)
+                layout = [(0, 0, scale, int(group[3]) if group else NORMAL, True,
+                           [(CONNECTOR, vmode[0], {})])]
+            else:
+                layout = build_layout(monitors, logical,
+                                      extra_reals(monitors, logical), force_scale=scale)
+            if layout is None:
+                break
+            apply(serial, layout)
+            time.sleep(1.0)
+        _serial, monitors, logical = state()
+        save_prefs(monitors, logical)
+        snapshot_xml(monitors, logical)
+        return True
+
+    # physical monitor: go through a state without the virtual monitor
+    was = mode
+    if was != "base":
+        cmd_base()
+    applied = False
+    for _ in range(4):
+        serial, monitors, logical = state()
+        groups = []
+        for g in logical:
+            conns = []
+            for c in g[5]:
+                mon = {m[0][0]: m for m in monitors}.get(c[0])
+                if not mon:
+                    continue
+                m = mode_by_id(mon, c[1]) or current_mode(mon) or best_mode(mon)
+                if m:
+                    conns.append((c[0], m[0], {}))
+            if not conns:
+                continue
+            hit = any(c[0] == connector for c in conns)
+            groups.append((int(g[0]), int(g[1]), scale if hit else float(g[2]),
+                           int(g[3]), bool(g[4]), tuple(conns)))
+        if not groups:
+            break
+        apply(serial, groups)
+        time.sleep(1.0)
+        applied = True
+    _serial, monitors, logical = state()
+    save_prefs(monitors, logical)
+    snapshot_xml(monitors, logical)
+    if was != "base":
+        command(was)
+    return applied
+
+
+def apply_transform(connector, transform):
+    """Rotates a monitor and chains the others to its right.
+
+    A rotation changes the logical edges (1920x1080 becomes 1080x1920): the
+    layout must be recomputed, or Mutter refuses it ("Logical monitors not
+    adjacent"). So go back to base, place the monitors from left to right in
+    the order received, then give the tool its mode back.
+    """
+    was = read_mode()
+    if was != "base":
+        cmd_base()
+    applied = False
+    for _ in range(4):
+        serial, monitors, logical = state()
+        by_conn = {m[0][0]: m for m in monitors}
+        rows = []
+        for g in logical:
+            conns, modes = [], []
+            hit = False
+            for c in g[5]:
+                mon = by_conn.get(c[0])
+                if not mon:
+                    continue
+                m = mode_by_id(mon, c[1]) or current_mode(mon) or best_mode(mon)
+                if not m:
+                    continue
+                conns.append((c[0], m[0], {}))
+                modes.append(m)
+                hit = hit or c[0] == connector
+            if not conns:
+                continue
+            rows.append({"x": int(g[0]), "y": int(g[1]), "scale": float(g[2]),
+                         "transform": transform if hit else int(g[3]),
+                         "primary": bool(g[4]), "conns": tuple(conns),
+                         "modes": modes})
+        if not any(c[0] == connector for r in rows for c in r["conns"]):
+            break
+        # The rotated monitor changes size: fit_layout (in apply) slides the
+        # monitors that now overlap or float, keeping the left-to-right order.
+        layout = [(r["x"], r["y"], r["scale"], r["transform"], r["primary"],
+                   r["conns"]) for r in rows]
+        try:
+            apply(serial, layout)
+        except GLib.Error as e:
+            raise SystemExit(f"{connector}: Mutter refused the rotation: {e.message}")
+        time.sleep(1.0)
+        applied = True
+        break
+    _serial, monitors, logical = state()
+    save_prefs(monitors, logical)
+    snapshot_xml(monitors, logical)
+    if was != "base":
+        command(was)
+    return applied
+
+
+def first_physical():
+    """Connector of the first physical monitor that Mutter lists."""
+    _serial, monitors, _logical = state()
+    conn = next((m[0][0] for m in monitors if not is_virtual(m)), None)
+    if conn is None:
+        raise SystemExit("rotate: no physical monitor found, give its connector")
+    return conn
+
+
+def cmd_rotate(value, connector=None):
+    """Rotates a monitor (normal, left, right, inverted) and remembers it.
+
+    CONNECTOR defaults to the first physical monitor that Mutter lists.
+    """
+    if value not in ROTATIONS:
+        raise SystemExit(f"invalid rotation: {value} "
+                         f"(normal, left, right, inverted)")
+    if connector is None:
+        connector = first_physical()
+    transform = ROTATIONS[value]
+    if not apply_transform(connector, transform):
+        print(f"{connector}: rotation not applied", file=sys.stderr)
+        return cmd_list()
+    if connector == CONNECTOR:
+        # The virtual monitor's rotation is an explicit setting, kept once applied.
+        prefs = load_prefs()
+        prefs["virtual"]["transform"] = transform
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(PREFS_FILE + ".tmp", "w") as f:
+            json.dump(prefs, f, indent=1)
+        os.replace(PREFS_FILE + ".tmp", PREFS_FILE)
+    return cmd_list()
+
+
+def cmd_scale(value, connector=None):
+    """Changes the scale of a monitor (the virtual one by default) and remembers it."""
+    if connector is None:
+        connector = CONNECTOR
+    try:
+        scale = float(value)
+    except ValueError:
+        raise SystemExit(f"invalid scale: {value}")
+    _serial, monitors, _logical = state()
+    mon = next((m for m in monitors if m[0][0] == connector), None)
+    mmode = (current_mode(mon) or preferred_mode(mon)) if mon else None
+    if mmode and mmode[5] and not scale_supported(mmode, scale):
+        accepted = ", ".join(f"{float(x):.4g}" for x in mmode[5])
+        raise SystemExit(f"{connector}: Mutter does not accept scale {scale:g} at "
+                         f"{mmode[1]}x{mmode[2]} (accepted: {accepted})")
+    if connector == CONNECTOR:
+        # The virtual monitor's scale is an explicit setting, used by every
+        # stream; between streams it is only remembered (applying it would
+        # switch the virtual monitor on).
+        prefs = load_prefs()
+        prefs["virtual"]["scale"] = scale
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(PREFS_FILE + ".tmp", "w") as f:
+            json.dump(prefs, f, indent=1)
+        os.replace(PREFS_FILE + ".tmp", PREFS_FILE)
+        if read_mode() == "base":
+            print(f"{connector}: scale {scale:g} used from the next stream")
+            return cmd_list()
+    try:
+        ok = apply_scale(connector, scale)
+    except GLib.Error as e:
+        raise SystemExit(f"{connector}: Mutter refused scale {scale:g}: {e.message}")
+    if not ok:
+        print(f"{connector}: scale not applied", file=sys.stderr)
+    return cmd_list()
+
+
+def cmd_boot():
+    """At login: plugs the virtual connector (off), then applies base.
+
+    Better to connect it now, at rest, than while a stream is starting: the
+    next session finds its monitor already there. If the connector cannot be
+    created (no kernel access), say so without blocking the base layout.
+    """
+    try:
+        ensure_virtual()
+    except SessionUnreachable:
+        raise
+    except SystemExit as e:
+        print(f"virtual monitor unavailable: {e}", file=sys.stderr)
+    if stream_open() or wait_running() or session_marked():
+        # Logged in from the login screen while a stream was already restarted:
+        # base would turn off the monitor being streamed.
+        print("stream running: base left to the watcher", flush=True)
+        return 0
+    return cmd_base()
+
+
+def cmd_off():
+    """Removes the virtual monitor (unplugs the connector).
+
+    Avoid it during a session: an unplug and replug cycle has crashed
+    gnome-shell (SEGV in libgvc.so).
+    """
+    try:
+        helper("off")
+    finally:
+        time.sleep(0.6)
+        serial, monitors, logical = state()
+        layout = build_layout(monitors, logical)
+        if layout:
+            apply(serial, layout)
+    print("virtual monitor removed")
+    return 0
+
+
+def unplug_before_gdm():
+    """Unplugs the virtual connector before restarting GDM.
+
+    With no config for it, the login screen picks the highest-resolution
+    monitor as primary: the virtual one, which nobody sees locally. Unplugged,
+    the login screen shows on the physical monitor, which Sunshine then
+    streams (virtual connector not found).
+    """
+    try:
+        helper("off")
+    except SystemExit as e:
+        journal(f"virtual connector not unplugged before GDM: {e}")
+
+
+def should_restart_gdm(down, e, now):
+    """Should GDM be restarted? Only for the Xwayland freeze, seen at least
+    FREEZE_SEEN times over at least FREEZE_DELAY seconds, and only once."""
+    if not isinstance(e, XwaylandFreeze):
+        down["freeze"], down["freeze_since"] = 0, None
+        return False
+    down["freeze"] += 1
+    down["freeze_since"] = down["freeze_since"] or now
+    if (down["restarted"] or down["freeze"] < FREEZE_SEEN
+            or now - down["freeze_since"] < FREEZE_DELAY):
+        return False
+    down["restarted"] = True
+    return True
+
+
+def cmd_watch():
+    """Watches display changes and keeps the layout usable.
+
+    Modes: `base` (physical monitors only, the idle state), `extend` (physical
+    + virtual), `only` and `remote` (virtual alone). In `only` and `remote`,
+    the physical monitors must stay off; in `extend`, a physical monitor found
+    off (which happens when Sunshine takes the kernel display over) is turned
+    back on.
+
+    Safety net: if no session is open any more while still in a stream mode
+    (client killed, `wait` interrupted), back to base. If the last session
+    streamed the physical monitor instead of the virtual one, Sunshine was
+    stuck with the app running: it is restarted.
+    """
+    loop = GLib.MainLoop()
+    pending = {"id": 0}
+    idle = {"since": None, "cleaned": False}
+    restarted = {"at": 0.0, "env": False}
+    # Frozen desktop: a single log line per incident, and a pause between two
+    # tries (each try costs up to 2 x 5 s plus the diagnosis).
+    down = {"since": None, "until": 0.0, "freeze": 0, "freeze_since": None,
+            "restarted": False}
+
+    def freeze_confirmed(e):
+        """Restarts GDM if the Xwayland freeze lasts: nothing else fixes it."""
+        if not should_restart_gdm(down, e, time.time()):
+            return
+        message = (f"Xwayland freeze seen {down['freeze']} times in "
+                   f"{int(time.time() - down['freeze_since'])} s: restarting GDM "
+                   "(Moonlight streams the login screen)")
+        print(f"watch: {message}", flush=True)
+        journal(f"watcher: {message}")
+        unplug_before_gdm()
+        r = subprocess.run(GDM_RESTART, capture_output=True, text=True)
+        if r.returncode != 0:
+            down["restarted"] = False
+            journal("watcher: GDM restart refused ("
+                    f"{(r.stderr or r.stdout).strip()}): run `{PROG} fix-session`")
+
+    def can_restart():
+        """Avoids restarting Sunshine in a loop on the same incident."""
+        if time.time() - restarted["at"] < 120:
+            return False
+        restarted["at"] = time.time()
+        return True
+
+    def repair(mode):
+        """Restores the layout of the current mode. -> True if it now matches."""
+        global RESTORE
+        RESTORE = mode == "base"
+        try:
+            monitors, logical = converge(mode, tries=3, delay=0.8)
+        finally:
+            RESTORE = False
+        save_prefs(monitors, logical)
+        snapshot_xml(monitors, logical)
+        return settled(mode, monitors, logical) is None
+
+    def check():
+        pending["id"] = 0
+        if time.time() < down["until"]:
+            return False
+        guard = lock(wait=False)
+        if guard is None:
+            return False  # a command (extend/only/base/wait) holds the lock
+        try:
+            mode = read_mode()
+            # An engaged Sunshine app counts as a session: its cmd already
+            # runs, even if the client has not opened the stream yet.
+            open_session = (stream_open() or wait_running()
+                            or session_marked())
+
+            if open_session:
+                idle["since"] = None
+                idle["cleaned"] = False
+                # Session open without our `prep` while ours stayed engaged:
+                # the client sees the physical monitor. Restart Sunshine so
+                # that its reconnection starts from the right monitor, at most
+                # once every two minutes.
+                if mode == "base" and stuck_own_app() and can_restart():
+                    print("app left open: Sunshine restarted", flush=True)
+                    unlock(guard)
+                    guard = None
+                    restart_sunshine()
+                    return False
+                _s, monitors, logical = state()
+                if mode != "base" and (mirrored(logical) or settled(mode, monitors, logical)):
+                    if repair(mode):
+                        print("layout fixed", flush=True)
+                return False
+
+            age = idle_for()
+            if age is None:
+                idle["since"] = idle["since"] or time.time()
+                age = time.time() - idle["since"]
+
+            # Session ended without `wait` doing its job (killed, missing):
+            # take the display back.
+            if age > 5 and mode != "base":
+                print("session ended: base layout", flush=True)
+                cmd_base()
+                mode = "base"
+
+            # And if Sunshine stayed stuck with the app running, it would skip
+            # the `prep-cmd` on the next stream: restart it once. Without
+            # waiting for that failed stream when `wait` is no longer there to
+            # do it (killed) and no resume happened within GRACE seconds.
+            if not idle["cleaned"] and can_restart() and (
+                    captured_wrong_screen() or sunshine_stuck()
+                    or (age > GRACE and app_engaged())):
+                idle["cleaned"] = True
+                print("Sunshine stuck on an app: restarting", flush=True)
+                unlock(guard)
+                guard = None
+                restart_sunshine()
+                return False
+
+            _s, monitors, logical = state()
+            if mode != "base" and (mirrored(logical) or settled(mode, monitors, logical)):
+                if repair(mode):
+                    print("layout fixed", flush=True)
+            elif mode == "base" and (active() or base_layout(monitors, logical)):
+                # The virtual monitor is still on outside a stream: switch it
+                # off (the physical monitors get their remembered layout back).
+                if repair("base"):
+                    print("base layout restored", flush=True)
+            elif mode == "base" and not mirrored(logical):
+                # Outside streams, a change made in GNOME Settings is learnt.
+                save_prefs(monitors, logical, learn_disabled=True)
+        except SessionUnreachable as e:
+            down["until"] = time.time() + 30
+            if down["since"] is None:
+                down["since"] = time.time()
+                print(f"watch: {e}", flush=True)
+                journal(f"watcher: {e}")
+            freeze_confirmed(e)
+            return False
+        except (Exception, SystemExit) as e:  # never die on a one-off error
+            print(f"watch: {e}", flush=True)
+        finally:
+            unlock(guard)
+        if down["since"] is not None:
+            print(f"watch: gnome-shell answers again "
+                  f"(after {int(time.time() - down['since'])} s)", flush=True)
+            down["since"], down["freeze"], down["freeze_since"] = None, 0, None
+        return False
+
+    def on_signal(_proxy, _sender, signal, _params):
+        if signal != "MonitorsChanged":
+            return
+        if pending["id"]:
+            GLib.source_remove(pending["id"])
+        pending["id"] = GLib.timeout_add(1200, check)
+
+    def tick():
+        try:
+            check()
+            sunshine_env_check()
+        except BaseException as e:  # an exception here would remove the loop from GLib
+            try:
+                print(f"watch: {e}", flush=True)
+            except OSError:
+                pass
+        return True
+
+    def sunshine_env_check():
+        """Sunshine started at boot has no WAYLAND_DISPLAY: restart it once,
+        between two streams, so that it gets the Wayland mapping back
+        (absolute mouse, pen) once the session is open."""
+        if restarted["env"] or stream_open() or wait_running() or session_marked():
+            return
+        if sunshine_lacks_wayland():
+            restarted["env"] = True
+            print("Sunshine started without a Wayland session: restarted", flush=True)
+            restart_sunshine()
+
+    p = proxy()
+    p.connect("g-signal", on_signal)
+    GLib.timeout_add(3000, check)  # one pass at startup
+    GLib.timeout_add_seconds(5, tick)  # watches the end of sessions
+    loop.run()
+
+
+def cmd_fix_session():
+    """Frozen desktop: restarts GDM. Does nothing if gnome-shell answers.
+
+    After the restart the login screen shows (unless autologin is on) and can
+    be streamed by Moonlight: any entry, then the password.
+    """
+    try:
+        state()
+        print("gnome-shell answers: nothing to fix")
+        return 0
+    except NoSession:
+        print("no GNOME session: the login screen is already there")
+        return 0
+    except SessionUnreachable as e:
+        print(e)
+    journal("fix-session: restarting GDM")
+    unplug_before_gdm()
+    r = subprocess.run(GDM_RESTART[:1] + GDM_RESTART[2:])  # interactive sudo if needed
+    if r.returncode == 0:
+        print("GDM restarted: log in (Moonlight, any entry)")
+    return r.returncode
+
+
+def usage():
+    print(__doc__.strip())
+    return 2
+
+
+# Actions that take the lock before running. `reapply` takes it without
+# waiting (cmd_reapply); the others do not take it here.
+LOCKED_ACTIONS = ("extend", "on", "only", "remote", "base", "off", "wait", "prep",
+                  "boot", "scale", "rotate")
+UNLOCKED_ACTIONS = ("list", "watch", "fix-session", "reapply")
+
+
+def main(argv):
+    action = argv[1] if len(argv) > 1 else "list"
+    if action not in LOCKED_ACTIONS and action not in UNLOCKED_ACTIONS:
+        return usage()
+    try:
+        ensure_config()
+        if action != "list":
+            require_connector()
+    except ConfigError as e:
+        if action == "reapply":
+            # Never fail here: Sunshine runs `reapply` before it starts.
+            print(f"reapply: {e}", file=sys.stderr)
+            return 0
+        raise
+    if action in LOCKED_ACTIONS:
+        lock()
+
+    if action == "list":
+        return cmd_list()
+    if action in ("extend", "on"):
+        return cmd_extend()
+    if action == "only":
+        return cmd_only()
+    if action == "remote":
+        return cmd_remote()
+    if action == "base":
+        return cmd_base()
+    if action == "wait":
+        return cmd_wait(argv[2] if len(argv) > 2 else "extend")
+    if action == "reapply":
+        return cmd_reapply()
+    if action == "prep":
+        return cmd_prep(argv[2] if len(argv) > 2 else "extend")
+    if action == "scale":
+        return cmd_scale(argv[2] if len(argv) > 2 else str(FALLBACK_SCALE),
+                         argv[3] if len(argv) > 3 else CONNECTOR)
+    if action == "rotate":
+        return cmd_rotate(argv[2] if len(argv) > 2 else "normal",
+                          argv[3] if len(argv) > 3 else None)
+    if action == "boot":
+        return cmd_boot()
+    if action == "off":
+        return cmd_off()
+    if action == "watch":
+        cmd_watch()
+        return 0
+    if action == "fix-session":
+        return cmd_fix_session()
+    return usage()
+
+
+def run(argv):
+    try:
+        return main(argv)
+    except SessionUnreachable as e:
+        action = " ".join(argv[1:]) or "list"
+        print(e, file=sys.stderr)
+        if isinstance(e, NoSession) and argv[1:2] and argv[1] in (
+                "prep", "wait", "base", "reapply"):
+            # Login screen: Sunshine streams the physical monitor, so the user
+            # can log in remotely. A failure here would block the stream.
+            journal(f"{action}: {e}: physical monitor streamed as is")
+            return 0
+        journal(f"{action}: {e}")
+        return EXIT_SESSION
+    except (Exception, SystemExit) as e:
+        if isinstance(e, SystemExit) and e.code in (None, 0):
+            return 0
+        action = " ".join(argv[1:]) or "list"
+        print(e, file=sys.stderr)
+        journal(f"{action}: {type(e).__name__}: {e}")
+        return e.code if isinstance(e, SystemExit) and isinstance(e.code, int) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv))

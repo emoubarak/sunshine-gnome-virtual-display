@@ -1,0 +1,49 @@
+{
+  "env": {
+    "PATH": "$(PATH):$(HOME)/.local/bin"
+  },
+  "apps": [
+    {
+      "name": "Extend",
+      "image-path": "@ASSETS@/extend.png",
+      "working-dir": "@HOME@",
+      "prep-cmd": [
+        {
+          "do": "gnome-virtual-display prep extend",
+          "undo": "gnome-virtual-display base"
+        }
+      ],
+      "detached": [
+        "gnome-virtual-display wait extend"
+      ]
+    },
+    {
+      "name": "Virtual only",
+      "image-path": "@ASSETS@/virtual-only.png",
+      "working-dir": "@HOME@",
+      "prep-cmd": [
+        {
+          "do": "gnome-virtual-display prep only",
+          "undo": "gnome-virtual-display base"
+        }
+      ],
+      "detached": [
+        "gnome-virtual-display wait only"
+      ]
+    },
+    {
+      "name": "Remote",
+      "image-path": "@ASSETS@/remote.png",
+      "working-dir": "@HOME@",
+      "prep-cmd": [
+        {
+          "do": "gnome-virtual-display prep remote",
+          "undo": "gnome-virtual-display base"
+        }
+      ],
+      "detached": [
+        "gnome-virtual-display wait remote"
+      ]
+    }
+  ]
+}

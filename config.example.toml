@@ -1,0 +1,36 @@
+# ~/.config/gnome-virtual-display/config.toml
+# Written by install.sh. Every key is optional except connector.
+
+# Free connector of the host GPU that becomes the virtual display (no cable plugged in it).
+connector = "DP-2"
+
+# Match the client: before each stream, give the virtual display the resolution and refresh rate
+# the Moonlight client asked for (Sunshine passes them to the app commands). A new EDID is written
+# only when the current one does not already offer that mode. Set to false to keep one fixed EDID
+# (for example the real EDID of your client's panel, installed with ./install.sh --edid FILE).
+match_client = true
+
+# EDID injected into the connector (root-owned copy, written by install.sh or by match_client).
+edid = "/etc/gnome-virtual-display/edid.bin"
+
+# Scale of the virtual display the first time it appears (then your choice in Settings > Displays,
+# or "gnome-virtual-display scale N", is remembered).
+fallback_scale = 1.25
+
+# Refresh rate of the "remote" mode (virtual display alone, for streams over a slow link) when the
+# client does not ask for one.
+remote_refresh = 60.0
+
+# Seconds a dropped stream keeps the virtual layout, so a quick reconnection lands on the right screen.
+grace = 90
+
+# Sunshine user unit and log (the log tells which screen a session captured and when it ended).
+sunshine_unit = "app-dev.lizardbyte.app.Sunshine.service"
+sunshine_log = "~/.config/sunshine/sunshine.log"
+
+# Turn GNOME's mouse acceleration off during a stream: the client already accelerates the pointer,
+# accelerating it twice makes it faster than on the client. Restored after the stream.
+flat_mouse_during_stream = true
+
+# Root helper called through sudo.
+helper = "/usr/local/sbin/gnome-virtual-display-drm"

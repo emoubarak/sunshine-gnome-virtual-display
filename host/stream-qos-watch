@@ -1,0 +1,42 @@
+#!/bin/bash
+# stream-qos-watch: follows the Sunshine journal and keeps stream-qos on while at least one
+# Moonlight session is active, off otherwise. Runs as a user service (systemd/stream-qos-watch.service).
+#
+# Session ends that Sunshine really logs: "CLIENT DISCONNECTED", "<ip>: Ping Timeout" (Wi-Fi lost,
+# client asleep: no DISCONNECTED line and no undo command), "Executing Undo Cmd" alone (Quit from
+# Moonlight). Sessions are counted because two can overlap ("active sessions: 2" when a client
+# reconnects before its old session timed out).
+# Every 60 s without a line the real state is checked again: shaping missing after a switch from
+# Ethernet to Wi-Fi, or left in place with no session.
+set -u
+U=${SUNSHINE_UNIT:-app-dev.lizardbyte.app.Sunshine.service}
+q() { sudo -n /usr/local/sbin/stream-qos "$1" && return 0; logger -t stream-qos "sudo stream-qos $1 failed"; return 1; }
+
+shaped() {  # does the Wi-Fi of the default route carry the shaping? (no root needed)
+  local i
+  i=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+  [ -n "$i" ] && [ -d "/sys/class/net/$i/wireless" ] || return 2
+  tc qdisc show dev "$i" ingress 2>/dev/null | grep -q ingress
+}
+
+state=off; n=0
+q off
+journalctl --user -f -n 0 -o cat -u "$U" | while :; do
+  if IFS= read -r -t 60 l; then
+    case "$l" in
+      *"New streaming session started [active sessions: "*)
+        m=${l##*active sessions: }; m=${m%%]*}; case $m in ''|*[!0-9]*) m=1 ;; esac; n=$m ;;
+      *"CLIENT CONNECTED"*) [ "$n" -gt 0 ] || n=1 ;;
+      *"CLIENT DISCONNECTED"*|*"Ping Timeout"*) [ "$n" -gt 0 ] && n=$((n-1)) ;;
+      *"Executing Undo Cmd"*|*"Terminate handler called"*|"Started "*|"Stopped "*|*"Main process exited"*) n=0 ;;
+      *) continue ;;
+    esac
+  else
+    [ $? -gt 128 ] || exit 1  # journalctl ended: systemd restarts the watcher
+    shaped; s=$?
+    if [ "$n" -gt 0 ] && [ $s -eq 1 ]; then state=off; fi  # expected but missing
+    if [ "$n" -eq 0 ] && [ $s -eq 0 ]; then state=on; fi   # left over without a session
+  fi
+  if [ "$n" -gt 0 ]; then [ $state = on ] || { q on && state=on; }
+  else [ $state = off ] || { q off && state=off; }; fi
+done

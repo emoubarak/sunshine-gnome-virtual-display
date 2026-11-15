@@ -1,0 +1,159 @@
+#!/usr/bin/python3 -I
+"""Inject an EDID into a free DRM connector and force it connected (root helper).
+
+Called by gnome-virtual-display through sudo. It only accepts a connector name
+from a fixed pattern and only reads the EDID from a fixed root-owned path, so the
+sudo rule cannot be used to read or write anything else. It runs with an
+isolated Python (-I): no user site-packages, no PYTHON* variables.
+
+Usage:
+  gnome-virtual-display-drm on  CONNECTOR [WIDTHxHEIGHT@HZ]
+  gnome-virtual-display-drm off CONNECTOR
+
+With a mode, a new EDID is generated for it first (match_client: the virtual
+display takes the resolution the Moonlight client asked for) and saved as the
+current EDID.
+
+Files (root-owned, written by install.sh):
+  /etc/gnome-virtual-display/edid.bin   EDID to inject (128 or 256 bytes)
+  /usr/local/lib/gnome-virtual-display/make_edid.py
+                                        EDID generator (copy of host/make-edid)
+  /etc/gnome-virtual-display/drm.conf   optional, "driver = amdgpu": restricts the
+                                        search to the cards of that kernel driver
+                                        (needed when two GPUs have a connector with
+                                        the same name)
+
+Card numbers change with enumeration order (an external GPU can turn card0 into
+card1), so the card is found through its connector and driver, never by index.
+"""
+import importlib.util
+import os
+import pathlib
+import re
+import stat
+import sys
+
+DEBUGFS = pathlib.Path("/sys/kernel/debug/dri")
+CARDS = pathlib.Path("/sys/class/drm")
+CONF_DIR = pathlib.Path("/etc/gnome-virtual-display")
+EDID_FILE = CONF_DIR / "edid.bin"
+DRM_CONF = CONF_DIR / "drm.conf"
+CONNECTOR_RE = re.compile(r"^(DP|HDMI-A|DVI-D|DVI-I)-[1-9][0-9]?$")
+DRIVER_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+MODE_RE = re.compile(r"^([1-9][0-9]{2,3})x([1-9][0-9]{2,3})@([1-9][0-9]{1,2})$")
+GENERATOR = pathlib.Path("/usr/local/lib/gnome-virtual-display/make_edid.py")
+
+
+def die(msg, code=1):
+    print(f"gnome-virtual-display-drm: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def wanted_driver():
+    try:
+        text = DRM_CONF.read_text()
+    except FileNotFoundError:
+        return None
+    for line in text.splitlines():
+        m = re.fullmatch(r'\s*driver\s*=\s*"?([^"\s]+)"?\s*', line)
+        if m:
+            if not DRIVER_RE.match(m[1]):
+                die(f"invalid driver in {DRM_CONF}: {m[1]}")
+            return m[1]
+    return None
+
+
+def connector_dir(conn):
+    driver = wanted_driver()
+    found = []
+    for card in sorted(CARDS.glob("card[0-9]*")):
+        minor = card.name[4:]
+        if not minor.isdigit():
+            continue
+        try:
+            card_driver = (card / "device" / "driver").resolve().name
+        except OSError:
+            continue
+        if driver and card_driver != driver:
+            continue
+        d = DEBUGFS / minor / conn
+        if d.is_dir():
+            found.append((d, card_driver))
+    if not found:
+        where = f" on a {driver} card" if driver else ""
+        die(f"connector {conn} not found{where} (is debugfs mounted at {DEBUGFS.parent}?)")
+    if len(found) > 1:
+        names = ", ".join(f"{d.parent.name} ({drv})" for d, drv in found)
+        die(f"connector {conn} exists on several cards: {names}; set 'driver = ...' in {DRM_CONF}")
+    return found[0][0]
+
+
+def generate(mode):
+    m = MODE_RE.match(mode)
+    if not m:
+        die(f"mode not allowed: {mode}", 2)
+    width, height, refresh = int(m[1]), int(m[2]), int(m[3])
+    if not (320 <= width <= 4095 and 240 <= height <= 4095 and 24 <= refresh <= 240):
+        die(f"mode out of range: {mode}", 2)
+    for path in (GENERATOR, GENERATOR.parent):
+        st = path.stat()
+        if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            die(f"{path} must be owned by root and not writable by others")
+    spec = importlib.util.spec_from_file_location("make_edid", GENERATOR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    extra = [] if refresh == 60 else [60.0]
+    try:
+        edid = mod.build(width, height, float(refresh), extra, "Virtual",
+                         (round(width / 200 * 25.4), round(height / 200 * 25.4)))
+    except ValueError as e:
+        die(str(e))
+    tmp = EDID_FILE.with_suffix(".tmp")
+    tmp.write_bytes(edid)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, EDID_FILE)
+
+
+def write(d, name, data):
+    f = d / name
+    if not f.exists():
+        return
+    try:
+        f.write_bytes(data)
+    except OSError as e:
+        die(f"{f}: {e}")
+
+
+def main():
+    if len(sys.argv) not in (3, 4) or sys.argv[1] not in ("on", "off") or (
+            len(sys.argv) == 4 and sys.argv[1] != "on"):
+        die(__doc__.split("\n\n")[2].strip(), 2)
+    action, conn = sys.argv[1], sys.argv[2]
+    if not CONNECTOR_RE.match(conn):
+        die(f"connector name not allowed: {conn}", 2)
+    d = connector_dir(conn)
+
+    if action == "on":
+        if len(sys.argv) == 4:
+            generate(sys.argv[3])
+        try:
+            edid = EDID_FILE.read_bytes()
+        except OSError as e:
+            die(f"{EDID_FILE}: {e}")
+        if len(edid) not in (128, 256) or edid[:8] != bytes.fromhex("00ffffffffffff00"):
+            die(f"{EDID_FILE} is not a valid EDID (size or header)")
+        write(d, "edid_override", edid)
+        write(d, "force", b"on\n")
+        write(d, "trigger_hotplug", b"1\n")
+        print(f"{conn}: EDID injected ({len(edid)} bytes), connector forced on")
+        return 0
+
+    write(d, "force", b"off\n")
+    write(d, "edid_override", b"reset")  # exactly 5 bytes, anything longer is parsed as an EDID
+    write(d, "trigger_hotplug", b"1\n")
+    print(f"{conn}: EDID removed, connector released")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Generate a 128-byte EDID 1.4 for a virtual monitor, or decode one.
+
+  make-edid 2400x1600@120 -o edid.bin            # 120 Hz preferred, 60 Hz extra
+  make-edid 1920x1080@60 --name "Living room" -o tv.bin
+  make-edid --decode edid.bin
+
+Timings follow VESA CVT reduced blanking v1 (160 px horizontal blank, 460 us
+minimum vertical blank), the same family real laptop panels use, with the pixel
+clock rounded to the 10 kHz step of the EDID instead of CVT's 0.25 MHz. The extra
+refresh rates keep the pixel clock and horizontal timing of the preferred mode
+and only stretch the vertical blank, like a panel that supports several rates:
+the GPU then switches rates without a modeset of the link.
+
+Fast modes that do not fit with v1 switch to CVT reduced blanking v2 (80 px
+horizontal blank). Limit: EDID 1.4 detailed timings stop at a 655.35 MHz pixel
+clock and 4095 pixels per side (3840x2160 tops out near 74 Hz). Higher modes need
+a DisplayID extension, which this tool does not write.
+"""
+import argparse
+import math
+import re
+import sys
+from datetime import date
+
+HEADER = bytes.fromhex("00ffffffffffff00")
+SRGB_CHROMA = bytes.fromhex("ee91a3544c99260f5054")
+MAX_PCLK_10KHZ = 0xFFFF
+
+
+def cvt_rb1(width, height, refresh):
+    """CVT reduced blanking v1 timing. Returns a dict of integers (pixel clock in 10 kHz)."""
+    h_blank, h_sync, h_fp = 160, 32, 48
+    v_fp, min_v_bp, min_vblank_us = 3, 6, 460.0
+    aspect = width / height
+    v_sync = 10
+    for ratio, sync in ((4 / 3, 4), (16 / 9, 5), (16 / 10, 6), (5 / 4, 7), (15 / 9, 7)):
+        if abs(aspect - ratio) < 0.01:
+            v_sync = sync
+            break
+    h_period_est = (1e6 / refresh - min_vblank_us) / height
+    vbi = max(math.floor(min_vblank_us / h_period_est) + 1, v_fp + v_sync + min_v_bp)
+    h_total = width + h_blank
+    v_total = height + vbi
+    # CVT rounds the clock down to 0.25 MHz; a detailed timing stores 10 kHz steps, so round to
+    # those instead and land on the requested rate (119.9996 Hz instead of 119.966 Hz).
+    return {
+        "pclk": round(refresh * h_total * v_total / 1e4),
+        "h_active": width, "h_blank": h_blank, "h_fp": h_fp, "h_sync": h_sync,
+        "v_active": height, "v_blank": vbi, "v_fp": v_fp, "v_sync": v_sync,
+    }
+
+
+def cvt_rb2(width, height, refresh):
+    """CVT reduced blanking v2 (80 px horizontal blank): for fast modes whose v1 timing is
+    over the EDID pixel clock limit. The extra vertical blank goes to the back porch,
+    since a detailed timing cannot store a front porch above 63 lines."""
+    h_blank, h_sync, h_fp = 80, 32, 8
+    v_fp, v_sync, min_v_bp, min_vblank_us = 3, 8, 6, 460.0
+    h_period_est = (1e6 / refresh - min_vblank_us) / height
+    vbi = max(math.floor(min_vblank_us / h_period_est) + 1, v_fp + v_sync + min_v_bp)
+    return {
+        "pclk": round(refresh * (width + h_blank) * (height + vbi) / 1e4),
+        "h_active": width, "h_blank": h_blank, "h_fp": h_fp, "h_sync": h_sync,
+        "v_active": height, "v_blank": vbi, "v_fp": v_fp, "v_sync": v_sync,
+    }
+
+
+def timing(width, height, refresh):
+    """CVT-RB v1, or v2 when v1 does not fit in a detailed timing."""
+    t = cvt_rb1(width, height, refresh)
+    return t if t["pclk"] <= MAX_PCLK_10KHZ else cvt_rb2(width, height, refresh)
+
+
+def stretched(base, refresh):
+    """Same pixel clock and horizontal timing, longer vertical blank for a lower rate."""
+    h_total = base["h_active"] + base["h_blank"]
+    v_total = round(base["pclk"] * 1e4 / (h_total * refresh))
+    t = dict(base)
+    t["v_blank"] = v_total - base["v_active"]
+    return t
+
+
+def refresh_of(t):
+    return t["pclk"] * 1e4 / ((t["h_active"] + t["h_blank"]) * (t["v_active"] + t["v_blank"]))
+
+
+def dtd(t, size_mm):
+    if not 0 < t["pclk"] <= MAX_PCLK_10KHZ:
+        raise ValueError(f"pixel clock {t['pclk'] / 100:.2f} MHz is over the EDID 1.4 limit of 655.35 MHz")
+    if t["h_active"] > 0xFFF or t["v_active"] > 0xFFF:
+        raise ValueError("a detailed timing stops at 4095 pixels per side")
+    if t["v_blank"] > 0xFFF or t["h_blank"] > 0xFFF:
+        raise ValueError("blanking does not fit in a detailed timing descriptor")
+    ha, hb, va, vb = t["h_active"], t["h_blank"], t["v_active"], t["v_blank"]
+    hfp, hsw, vfp, vsw = t["h_fp"], t["h_sync"], t["v_fp"], t["v_sync"]
+    wmm, hmm = size_mm
+    return bytes([
+        t["pclk"] & 0xFF, t["pclk"] >> 8,
+        ha & 0xFF, hb & 0xFF, ((ha >> 8) << 4) | (hb >> 8),
+        va & 0xFF, vb & 0xFF, ((va >> 8) << 4) | (vb >> 8),
+        hfp & 0xFF, hsw & 0xFF, ((vfp & 0xF) << 4) | (vsw & 0xF),
+        ((hfp >> 8) << 6) | ((hsw >> 8) << 4) | ((vfp >> 4) << 2) | (vsw >> 4),
+        wmm & 0xFF, hmm & 0xFF, ((wmm >> 8) << 4) | (hmm >> 8),
+        0, 0,
+        0x1A,  # digital separate sync, hsync +, vsync - (CVT reduced blanking)
+    ])
+
+
+def text_descriptor(tag, text):
+    raw = text.encode("ascii", "replace")[:13]
+    if len(raw) < 13:
+        raw += b"\n" + b" " * (12 - len(raw))
+    return bytes([0, 0, 0, tag, 0]) + raw
+
+
+def range_descriptor(timings):
+    rates = [refresh_of(t) for t in timings]
+    hfreqs = [t["pclk"] * 10 / (t["h_active"] + t["h_blank"]) for t in timings]  # kHz
+    # 120.001 Hz is a 120 Hz mode: tolerate rounding of the pixel clock before flooring/ceiling.
+    min_v, max_v = math.floor(min(rates) + 0.05), math.ceil(max(rates) - 0.05)
+    min_h, max_h = math.floor(min(hfreqs)), math.ceil(max(hfreqs))
+    max_pclk = math.ceil(max(t["pclk"] for t in timings) / 1000)  # 10 MHz units
+    # Values above 255 are stored with a +255 offset, flagged per field (EDID 1.4):
+    # bits 1:0 vertical, bits 3:2 horizontal, 10 = max only, 11 = min and max.
+    flags = 0
+    if max_v > 255:
+        flags |= 0x02
+        max_v -= 255
+        if min_v > 255:
+            flags |= 0x01
+            min_v -= 255
+    if max_h > 255:
+        flags |= 0x08
+        max_h -= 255
+        if min_h > 255:
+            flags |= 0x04
+            min_h -= 255
+    return bytes([0, 0, 0, 0xFD, flags, min_v, max_v, min_h, max_h, max_pclk, 0x01,
+                  0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20])
+
+
+def manufacturer(code):
+    a, b, c = (ord(x) - 64 for x in code.upper())
+    v = (a << 10) | (b << 5) | c
+    return bytes([v >> 8, v & 0xFF])
+
+
+def build(width, height, refresh, extra_rates, name, size_mm):
+    base = timing(width, height, refresh)
+    timings = [base]
+    for r in extra_rates:
+        if abs(r - refresh) < 0.5:
+            continue
+        t = stretched(base, r)
+        if t["v_blank"] > 0xFFF or t["v_blank"] < base["v_blank"]:
+            t = timing(width, height, r)
+        timings.append(t)
+    if len(timings) > 2:
+        raise ValueError("at most one extra refresh rate fits next to the name and range descriptors")
+    e = bytearray(HEADER)
+    e += manufacturer("LNX")
+    e += (0x5644).to_bytes(2, "little")  # product code
+    e += bytes(4)  # serial number
+    e += bytes([1, date.today().year - 1990])
+    e += bytes([1, 4])  # EDID 1.4
+    e += bytes([0xA5])  # digital, 8 bits per color, DisplayPort
+    e += bytes([round(size_mm[0] / 10), round(size_mm[1] / 10)])
+    e += bytes([120])  # gamma 2.2
+    e += bytes([0x06])  # RGB 4:4:4, sRGB default, preferred timing is native
+    e += SRGB_CHROMA
+    e += bytes([0x20, 0, 0])  # established timing: 640x480 @ 60 Hz
+    e += b"\x01\x01" * 8  # no standard timings
+    for t in timings:
+        e += dtd(t, size_mm)
+    e += range_descriptor(timings)
+    e += text_descriptor(0xFC, name)
+    if len(timings) == 1:
+        e += bytes([0, 0, 0, 0x10]) + bytes(14)  # dummy descriptor
+    e += bytes([0])  # no extension block
+    e += bytes([(-sum(e)) & 0xFF])
+    assert len(e) == 128
+    return bytes(e)
+
+
+def decode(data):
+    if len(data) < 128 or data[:8] != HEADER:
+        raise ValueError("not an EDID (bad size or header)")
+    if sum(data[:128]) & 0xFF:
+        raise ValueError("bad checksum")
+    lines = [f"EDID {data[18]}.{data[19]}, {data[21]}x{data[22]} cm, extensions {data[126]}"]
+    for k in range(4):
+        d = data[54 + 18 * k:72 + 18 * k]
+        pclk = d[0] | d[1] << 8
+        if pclk:
+            ha = d[2] | (d[4] >> 4) << 8
+            hb = d[3] | (d[4] & 0xF) << 8
+            va = d[5] | (d[7] >> 4) << 8
+            vb = d[6] | (d[7] & 0xF) << 8
+            hz = pclk * 1e4 / ((ha + hb) * (va + vb))
+            lines.append(f"timing: {ha}x{va} @ {hz:.3f} Hz, pixel clock {pclk / 100:.2f} MHz,"
+                         f" h blank {hb}, v blank {vb}")
+        elif d[3] == 0xFC:
+            lines.append("name: " + d[5:18].split(b"\n")[0].decode("ascii", "replace").strip())
+        elif d[3] == 0xFD:
+            f = d[4]
+            min_v = d[5] + (255 if f & 0x03 == 0x03 else 0)
+            max_v = d[6] + (255 if f & 0x02 else 0)
+            min_h = d[7] + (255 if f & 0x0C == 0x0C else 0)
+            max_h = d[8] + (255 if f & 0x08 else 0)
+            lines.append(f"range: {min_v}-{max_v} Hz, {min_h}-{max_h} kHz, max {d[9] * 10} MHz")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=__doc__.split("\n\n", 1)[1])
+    p.add_argument("mode", nargs="?", help="WIDTHxHEIGHT@HZ, for example 2400x1600@120")
+    p.add_argument("-o", "--output", help="file to write (default: stdout)")
+    p.add_argument("--extra-rate", type=float, action="append",
+                   help="additional refresh rate (default: 60 when the main rate is not 60)")
+    p.add_argument("--name", default="Virtual", help="monitor name, up to 13 ASCII characters")
+    p.add_argument("--size-mm", help="physical size WIDTHxHEIGHT in mm (default: from --dpi)")
+    p.add_argument("--dpi", type=float, default=200.0, help="pixel density used for the size (default 200)")
+    p.add_argument("--decode", metavar="FILE", help="print the timings of an existing EDID")
+    a = p.parse_args(argv)
+
+    if a.decode:
+        try:
+            with open(a.decode, "rb") as f:
+                print(decode(f.read()))
+        except (OSError, ValueError) as e:
+            print(f"make-edid: {a.decode}: {e}", file=sys.stderr)
+            return 1
+        return 0
+    m = re.fullmatch(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)", a.mode or "")
+    if not m:
+        p.error("mode must look like 2400x1600@120")
+    width, height, refresh = int(m[1]), int(m[2]), float(m[3])
+    if a.size_mm:
+        s = re.fullmatch(r"(\d+)x(\d+)", a.size_mm)
+        if not s:
+            p.error("--size-mm must look like 300x200")
+        size = (int(s[1]), int(s[2]))
+    else:
+        size = (round(width / a.dpi * 25.4), round(height / a.dpi * 25.4))
+    extra = a.extra_rate if a.extra_rate is not None else ([] if abs(refresh - 60) < 0.5 else [60.0])
+    try:
+        edid = build(width, height, refresh, extra, a.name, size)
+    except ValueError as e:
+        print(f"make-edid: {e}", file=sys.stderr)
+        return 1
+    if a.output:
+        with open(a.output, "wb") as f:
+            f.write(edid)
+        print(decode(edid), file=sys.stderr)
+    else:
+        sys.stdout.buffer.write(edid)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

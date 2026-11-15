@@ -1,0 +1,17 @@
+# Keeps the virtual display usable: plugs it (off) at login, repairs the layout,
+# frees Sunshine when it stays stuck on an app, restarts GDM on a confirmed Xwayland freeze.
+[Unit]
+Description=Keep the Sunshine virtual display usable (gnome-virtual-display)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+TimeoutStartSec=120
+ExecStartPre=-%h/.local/bin/gnome-virtual-display boot
+ExecStart=%h/.local/bin/gnome-virtual-display watch
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

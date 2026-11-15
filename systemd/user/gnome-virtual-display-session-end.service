@@ -1,0 +1,17 @@
+# Unplugs the virtual display when the GNOME session ends (logout, GDM restart). Otherwise the login
+# screen that follows picks the virtual display, often the largest one, as primary: invisible on the
+# host. The next session plugs it back (gnome-virtual-display boot). Never during a session: an
+# unplug/replug cycle under a running gnome-shell can crash it.
+[Unit]
+Description=Unplug the virtual display at the end of the GNOME session
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=-/usr/bin/sudo -n /usr/local/sbin/gnome-virtual-display-drm off @CONNECTOR@
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,15 @@
+# Unplugs the virtual display before every GDM start (PartOf: also on "systemctl restart gdm"), so the
+# login screen shows on the physical monitor. A separate unit rather than an ExecStartPre of gdm: GDM
+# runs in an SELinux domain that may not write to debugfs.
+[Unit]
+Description=Unplug the Sunshine virtual display before the login screen
+Before=gdm.service
+PartOf=gdm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/local/sbin/gnome-virtual-display-drm off @CONNECTOR@
+
+[Install]
+WantedBy=gdm.service

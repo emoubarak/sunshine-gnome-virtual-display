@@ -1,0 +1,14 @@
+# Shapes internet downloads on the host's Wi-Fi while a Moonlight client is connected (stream-qos).
+[Unit]
+Description=Shape downloads during Sunshine streams (stream-qos)
+After=@SUNSHINE_UNIT@
+
+[Service]
+Environment=SUNSHINE_UNIT=@SUNSHINE_UNIT@
+ExecStart=%h/.local/bin/stream-qos-watch
+ExecStopPost=-/usr/bin/sudo -n /usr/local/sbin/stream-qos off
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
