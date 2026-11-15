@@ -13,7 +13,10 @@
 #
 # Config: ~/.config/gnome-virtual-display/moonlight-lan.conf
 #   HOST=myhost          # host name as Moonlight shows it
-#   LAN_ADDRESS=192.0.2.10   # host address on the home LAN (reserve it in the router's DHCP)
+#   LAN_ADDRESS="192.0.2.20 192.0.2.10"   # host addresses on the home LAN, preferred first
+# Reserve each address in the router's DHCP. A host that is sometimes on Ethernet: list its
+# Ethernet address first, then its Wi-Fi one. All are probed at once (2 s at most) and the first
+# one in the list that answers wins.
 # Use it as the Exec= of the Moonlight desktop entry (see docs/network.md).
 set -u
 CONF=${MOONLIGHT_LAN_CONF:-$HOME/.config/gnome-virtual-display/moonlight-lan.conf}
@@ -21,20 +24,33 @@ ML_CONF="$HOME/.var/app/com.moonlight_stream.Moonlight/config/Moonlight Game Str
 HOST="" LAN_ADDRESS=""
 if [ -r "$CONF" ]; then
   HOST=$(sed -n 's/^[[:space:]]*HOST[[:space:]]*=[[:space:]]*"\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CONF" | tail -1)
-  LAN_ADDRESS=$(sed -n 's/^[[:space:]]*LAN_ADDRESS[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9.]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CONF" | tail -1)
+  LAN_ADDRESS=$(sed -n 's/^[[:space:]]*LAN_ADDRESS[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9. ]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CONF" | tail -1)
 fi
 
 fix_address() {
   [ -n "$HOST" ] && [ -n "$LAN_ADDRESS" ] && [ -f "$ML_CONF" ] || return 0
   pgrep -x moonlight >/dev/null && return 0  # a running Moonlight would overwrite the file
-  local n uuid
+  local n uuid a i=0 dir
   n=$(grep -m1 -E "^[0-9]+\\\\hostname=$HOST$" "$ML_CONF" | cut -d'\' -f1)
   [ -n "$n" ] || return 0
   uuid=$(grep -m1 -E "^$n\\\\uuid=" "$ML_CONF" | cut -d= -f2)
   [ -n "$uuid" ] || return 0
-  curl -s -m 2 "http://$LAN_ADDRESS:47989/serverinfo" | grep -qi "<uniqueid>$uuid<" || return 0
-  grep -qx "$n\\\\localaddress=$LAN_ADDRESS" "$ML_CONF" && return 0
-  sed -i "s/^$n\\\\localaddress=.*/$n\\\\localaddress=$LAN_ADDRESS/" "$ML_CONF"
+  dir=$(mktemp -d) || return 0
+  for a in $LAN_ADDRESS; do
+    i=$((i + 1))
+    { curl -s --connect-timeout 1 -m 2 "http://$a:47989/serverinfo" | grep -qi "<uniqueid>$uuid<" && : > "$dir/$i"; } &
+  done
+  wait
+  i=0
+  for a in $LAN_ADDRESS; do
+    i=$((i + 1))
+    [ -e "$dir/$i" ] || continue
+    rm -rf "$dir"
+    grep -qx "$n\\\\localaddress=$a" "$ML_CONF" && return 0
+    sed -i "s/^$n\\\\localaddress=.*/$n\\\\localaddress=$a/" "$ML_CONF"
+    return 0
+  done
+  rm -rf "$dir"
 }
 
 fix_address

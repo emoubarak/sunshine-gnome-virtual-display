@@ -44,6 +44,13 @@ Then use `moonlight-lan` as the `Exec=` of your Moonlight desktop entry (copy
 `com.moonlight_stream.Moonlight.desktop` to `~/.local/share/applications/` and change that line).
 Reserve the host's address in your router's DHCP settings so it does not change.
 
+A host that is sometimes on Ethernet has one address per network card. Reserve each one (Wi-Fi and
+every Ethernet port: the router reserves by MAC address) and list them, Ethernet first:
+`LAN_ADDRESS="192.0.2.20 192.0.2.10"`. They are probed at once and the first one that answers as
+the paired host wins, so the client follows the cable without any change. With both the cable and the
+Wi-Fi connected, the host already sends through the cable (NetworkManager gives Ethernet the lower
+route metric); the Ethernet address makes the client's packets take it too.
+
 Sunshine's own `packetsize` setting only caps the size the client asks for: leave it at 0.
 
 ## 2. Shape the host's downloads during a stream
@@ -74,4 +81,6 @@ Check during a stream: `/usr/local/sbin/stream-qos status` (no root needed), `jo
 ## Still the best fix
 
 An Ethernet cable from the host to the router: one Wi-Fi hop instead of two, and no airtime shared
-with the host's downloads.
+with the host's downloads. Nothing else to change: download shaping turns itself off when the
+default route is not Wi-Fi, and `moonlight-lan` picks the Ethernet address when it is listed first
+(see above).
