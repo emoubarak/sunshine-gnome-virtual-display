@@ -107,6 +107,7 @@ LOCK_FILE = os.path.join(STATE_DIR, "lock")
 PREFS_FILE = os.path.join(STATE_DIR, "prefs.json")
 XML_WRITTEN = os.path.join(STATE_DIR, "monitors-xml.sha256")  # hash of the last file we wrote
 SESSION_FILE = os.path.join(STATE_DIR, "session")
+DROPPED_FILE = os.path.join(STATE_DIR, "dropped-modes")  # "CONNECTOR WxH@R" the driver refused
 MOUSE_FILE = os.path.join(STATE_DIR, "mouse")  # acceleration profile to restore after the stream
 MOUSE_SCHEMA = "org.gnome.desktop.peripherals.mouse"
 LEGACY_VIRTUAL = os.path.join(STATE_DIR, "virtual.json")  # older state file, virtual monitor only
@@ -1560,6 +1561,16 @@ def reload_edid():
     VIRTUAL_NATIVE = (edid.width, edid.height) if edid and edid.width and edid.height else None
 
 
+def mode_dropped(width, height, refresh):
+    """True when the virtual connector is up but Mutter does not list a mode its EDID offers: the
+    driver dropped it (pixel clock above what the output can send, as on an i915 HDMI port). The
+    EDID must then be generated again, at 60 Hz if needed."""
+    _serial, monitors, _logical = state()
+    vmon = next((m for m in monitors if m[0][0] == CONNECTOR), None)
+    return bool(vmon) and not any(m[1] == width and m[2] == height and abs(m[3] - refresh) < 0.5
+                                  for m in vmon[1])
+
+
 def wait_for_mode(width, height, refresh, wait=15):
     """Waits until Mutter lists the new mode on the virtual connector."""
     deadline = time.time() + wait
@@ -1569,10 +1580,32 @@ def wait_for_mode(width, height, refresh, wait=15):
         if vmon and any(m[1] == width and m[2] == height and abs(m[3] - refresh) < 0.5
                         for m in vmon[1]):
             break
+        if vmon and vmon[1] and all(m[1] < 1024 for m in vmon[1]):
+            # Only the driver's 640x480 fallback: the EDID was read and its modes dropped (pixel
+            # clock too high for this output). Waiting longer will not bring them back.
+            deadline = min(deadline, time.time() + 3)
         if time.time() > deadline:
             raise SystemExit(f"Mutter does not show {width}x{height}@{refresh:g} on {CONNECTOR}")
         time.sleep(0.3)
     settle()
+
+
+def read_dropped():
+    try:
+        with open(DROPPED_FILE) as f:
+            return {line.strip() for line in f if line.strip()}
+    except OSError:
+        return set()
+
+
+def remember_dropped(key):
+    """A mode the output cannot send is remembered, so the next streams do not wait for it again."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(DROPPED_FILE, "a") as f:
+            f.write(key + "\n")
+    except OSError:
+        pass
 
 
 def match_client_mode(mode):
@@ -1590,18 +1623,28 @@ def match_client_mode(mode):
         return False
     width, height, refresh = wanted
     rate = int(round(refresh))
-    if edid_offers(read_edid(EDID_PATH), width, height, rate):
+    if f"{CONNECTOR} {width}x{height}@{rate}" in read_dropped():
+        rate = 60  # this output cannot send it: the 60 Hz EDID already in place is the right one
+    if edid_offers(read_edid(EDID_PATH), width, height, rate) and not mode_dropped(width, height, rate):
         return False
     # The second try is a 60 Hz-only EDID with its own CVT pixel clock: when the
     # driver dropped the fast mode for its clock, a 60 Hz mode stretched from it
     # (same clock) would be dropped too.
+    dropped = read_dropped()
     for rate in dict.fromkeys((rate, 60)):
+        key = f"{CONNECTOR} {width}x{height}@{rate}"
+        if key in dropped and rate != 60:
+            journal(f"match_client: {width}x{height}@{rate} skipped (refused before by the driver,"
+                    f" forget it by deleting {DROPPED_FILE})")
+            continue
         try:
             helper("on", f"{width}x{height}@{rate}")
             reload_edid()
             wait_for_mode(width, height, rate)
         except SystemExit as e:
             journal(f"match_client: {width}x{height}@{rate} refused: {e}")
+            if rate != 60:
+                remember_dropped(key)
             continue
         journal(f"match_client: virtual monitor set to {width}x{height}@{rate}")
         return True

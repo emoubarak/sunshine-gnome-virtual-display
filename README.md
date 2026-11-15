@@ -35,7 +35,8 @@ screen of the host, then get your desk back exactly as it was when the stream en
 - GNOME on Wayland (tested with GNOME 50).
 - **Secure Boot off**, or more precisely the kernel not in lockdown mode: lockdown forbids writing
   to debugfs, and the installer stops with a message when it is on.
-- An **AMD or Intel GPU** with one free DisplayPort or HDMI output (nothing plugged in it). The EDID
+- An **AMD or Intel GPU** with one free DisplayPort or HDMI output (nothing plugged in it; on Intel,
+  an HDMI one). The EDID
   is injected through the kernel's debugfs, which the NVIDIA proprietary driver does not offer. A
   machine with an NVIDIA card next to an AMD or Intel one works: the virtual monitor goes on the
   AMD/Intel side.
@@ -78,7 +79,8 @@ resolution unless you set `match_client = false`), `--uninstall`. Full list: `./
 ### Choosing a connector
 
 The installer takes the first free DisplayPort of the GPU that drives your desktop (NVIDIA cards are
-skipped), then HDMI if no DisplayPort is free. Any connector with nothing plugged in works, except
+skipped), then HDMI if no DisplayPort is free. On Intel (i915) it takes HDMI first: a DisplayPort
+with nothing plugged in has no link rate there and only offers 640x480. Any connector with nothing plugged in works, except
 ports that only exist when a dock or a USB-C device is attached. Use the kernel's name (`DP-2`,
 `HDMI-A-1`); GNOME calls the latter `HDMI-1`, the tool translates. To list them:
 `for c in /sys/class/drm/card*-*; do echo "$(basename $c) $(cat $c/status)"; done`.
@@ -140,16 +142,20 @@ client matching from 2400x1600 at 120 Hz to 1920x1080 at 60 Hz and back. Layouts
 physical monitors, HDMI naming and unplugged monitors are covered by the test suite
 (`python3 tests/test_layout.py`), and the layout fitting is checked against a real Mutter running
 headless with three virtual monitors (`tests/check_with_headless_mutter.py`, command in its header),
-not yet on real multi-monitor hardware. Reports from other GPUs, distributions and setups are welcome.
+not yet on real multi-monitor hardware. Also run on an Intel HD Graphics 630 laptop (i915, Kaby Lake,
+GTX 1060 next to it): the virtual monitor on a free HDMI port at 2400x1600 and 60 Hz, Extend next to
+the laptop panel. Reports from other GPUs, distributions and setups are welcome.
 
 ## Limits
 
 - EDID 1.4 detailed timings stop at a 655.35 MHz pixel clock and 4095 pixels per side: a 3840x2160
   client gets at most 74 Hz, a 2560x1440 client 159 Hz; above that the tool keeps the
   client's resolution at 60 Hz.
-- HDMI outputs are untested: the generated EDID declares a DisplayPort monitor without an HDMI
-  extension block, and some drivers may then cap an HDMI port at single-link DVI speed (165 MHz,
-  enough for 1920x1080 at 60 Hz). Prefer a free DisplayPort.
+- On an HDMI output the EDID declares an HDMI monitor with the HDMI vendor block (otherwise
+  drivers cap the port at single-link DVI speed, 165 MHz). The GPU still applies its own HDMI
+  limit: 300 MHz on Intel Kaby Lake, so 2400x1600 tops out at 60 Hz there. A mode the output
+  drops is remembered (`~/.local/state/gnome-virtual-display/dropped-modes`) and the next streams
+  go straight to 60 Hz.
 - HDR is not handled: layouts are applied without a color mode, so an HDR monitor falls back to SDR
   while the tool changes the layout.
 - `~/.config/monitors.xml` is rewritten for your current set of monitors (configurations of other

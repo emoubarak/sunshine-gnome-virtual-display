@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a 128-byte EDID 1.4 for a virtual monitor, or decode one.
+"""Generate an EDID 1.4 (128 bytes, 256 with --hdmi) for a virtual monitor, or decode one.
 
   make-edid 2400x1600@120 -o edid.bin            # 120 Hz preferred, 60 Hz extra
   make-edid 1920x1080@60 --name "Living room" -o tv.bin
@@ -16,6 +16,11 @@ Fast modes that do not fit with v1 switch to CVT reduced blanking v2 (80 px
 horizontal blank). Limit: EDID 1.4 detailed timings stop at a 655.35 MHz pixel
 clock and 4095 pixels per side (3840x2160 tops out near 74 Hz). Higher modes need
 a DisplayID extension, which this tool does not write.
+
+For an HDMI connector (--hdmi) the EDID declares an HDMI monitor and adds a CTA-861
+extension with the HDMI vendor block (256 bytes in total). Without it, drivers
+treat the sink as single-link DVI and drop every mode above 165 MHz (i915 does:
+2400x1600 at 60 Hz needs 253 MHz).
 """
 import argparse
 import math
@@ -26,6 +31,7 @@ from datetime import date
 HEADER = bytes.fromhex("00ffffffffffff00")
 SRGB_CHROMA = bytes.fromhex("ee91a3544c99260f5054")
 MAX_PCLK_10KHZ = 0xFFFF
+HDMI_MAX_TMDS_MHZ = 340  # HDMI 1.4 ceiling, declared by the sink; the source applies its own limit
 
 
 def cvt_rb1(width, height, refresh):
@@ -146,7 +152,21 @@ def manufacturer(code):
     return bytes([v >> 8, v & 0xFF])
 
 
-def build(width, height, refresh, extra_rates, name, size_mm):
+def cta_hdmi_extension():
+    """CTA-861 extension holding only an HDMI 1.4 vendor-specific data block."""
+    vsdb = bytes([0x03, 0x0C, 0x00,  # IEEE OUI 00-0C-03 (HDMI Licensing), least significant first
+                  0x10, 0x00,        # physical address 1.0.0.0
+                  0x00,              # no deep colour, no DVI dual-link
+                  HDMI_MAX_TMDS_MHZ // 5])
+    blocks = bytes([3 << 5 | len(vsdb)]) + vsdb  # tag 3: vendor specific
+    x = bytearray([0x02, 0x03, 4 + len(blocks), 0x00]) + blocks  # no DTD in the extension
+    x += bytes(127 - len(x))
+    x += bytes([(-sum(x)) & 0xFF])
+    assert len(x) == 128
+    return bytes(x)
+
+
+def build(width, height, refresh, extra_rates, name, size_mm, hdmi=False):
     base = timing(width, height, refresh)
     timings = [base]
     for r in extra_rates:
@@ -164,7 +184,7 @@ def build(width, height, refresh, extra_rates, name, size_mm):
     e += bytes(4)  # serial number
     e += bytes([1, date.today().year - 1990])
     e += bytes([1, 4])  # EDID 1.4
-    e += bytes([0xA5])  # digital, 8 bits per color, DisplayPort
+    e += bytes([0xA2 if hdmi else 0xA5])  # digital, 8 bits per color, HDMI-a or DisplayPort
     e += bytes([round(size_mm[0] / 10), round(size_mm[1] / 10)])
     e += bytes([120])  # gamma 2.2
     e += bytes([0x06])  # RGB 4:4:4, sRGB default, preferred timing is native
@@ -177,10 +197,10 @@ def build(width, height, refresh, extra_rates, name, size_mm):
     e += text_descriptor(0xFC, name)
     if len(timings) == 1:
         e += bytes([0, 0, 0, 0x10]) + bytes(14)  # dummy descriptor
-    e += bytes([0])  # no extension block
+    e += bytes([1 if hdmi else 0])  # extension blocks
     e += bytes([(-sum(e)) & 0xFF])
     assert len(e) == 128
-    return bytes(e)
+    return bytes(e) + (cta_hdmi_extension() if hdmi else b"")
 
 
 def decode(data):
@@ -209,6 +229,16 @@ def decode(data):
             min_h = d[7] + (255 if f & 0x0C == 0x0C else 0)
             max_h = d[8] + (255 if f & 0x08 else 0)
             lines.append(f"range: {min_v}-{max_v} Hz, {min_h}-{max_h} kHz, max {d[9] * 10} MHz")
+    if data[126] and len(data) >= 256 and data[128] == 0x02:
+        x = data[128:256]
+        if sum(x) & 0xFF:
+            raise ValueError("bad checksum in the CTA extension")
+        i = 4
+        while i < x[2]:
+            tag, n = x[i] >> 5, x[i] & 0x1F
+            if tag == 3 and x[i + 1:i + 4] == bytes([0x03, 0x0C, 0x00]) and n >= 7:
+                lines.append(f"hdmi: vendor block, max TMDS {x[i + 7] * 5} MHz")
+            i += 1 + n
     return "\n".join(lines)
 
 
@@ -223,6 +253,8 @@ def main(argv=None):
     p.add_argument("--name", default="Virtual", help="monitor name, up to 13 ASCII characters")
     p.add_argument("--size-mm", help="physical size WIDTHxHEIGHT in mm (default: from --dpi)")
     p.add_argument("--dpi", type=float, default=200.0, help="pixel density used for the size (default 200)")
+    p.add_argument("--hdmi", action="store_true",
+                   help="declare an HDMI monitor (adds the CTA extension; use it on an HDMI connector)")
     p.add_argument("--decode", metavar="FILE", help="print the timings of an existing EDID")
     a = p.parse_args(argv)
 
@@ -247,7 +279,7 @@ def main(argv=None):
         size = (round(width / a.dpi * 25.4), round(height / a.dpi * 25.4))
     extra = a.extra_rate if a.extra_rate is not None else ([] if abs(refresh - 60) < 0.5 else [60.0])
     try:
-        edid = build(width, height, refresh, extra, a.name, size)
+        edid = build(width, height, refresh, extra, a.name, size, hdmi=a.hdmi)
     except ValueError as e:
         print(f"make-edid: {e}", file=sys.stderr)
         return 1

@@ -96,5 +96,14 @@ except ValueError as err:
 
 check("decode: horizontal rate above 255 kHz", "291-292 kHz" in me.decode(me.build(1920, 1080, 240.0, [60.0], "F", (500, 300))), True)
 
+h = me.build(2400, 1600, 60.0, [], "Virtual", (305, 203), hdmi=True)
+check("hdmi: 256 bytes, one extension", (len(h), h[126]), (256, 1))
+check("hdmi: base block declares HDMI-a", h[20], 0xA2)
+check("hdmi: both checksums", (sum(h[:128]) & 0xFF, sum(h[128:]) & 0xFF), (0, 0))
+check("hdmi: CTA extension tag", h[128:130], bytes([0x02, 0x03]))
+check("hdmi: vendor block decoded", "max TMDS 340 MHz" in me.decode(h), True)
+check("hdmi: same timings as DisplayPort", me.decode(h).split("\n")[1:4],
+      me.decode(me.build(2400, 1600, 60.0, [], "Virtual", (305, 203))).split("\n")[1:4])
+
 print(f"\n{len(FAILED)} failure(s)")
 sys.exit(1 if FAILED else 0)

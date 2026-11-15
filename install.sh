@@ -124,7 +124,9 @@ fi
 
 # ---- connector and GPU ----------------------------------------------------------------------
 # The desktop GPU is the one with the most connected outputs; its first free DisplayPort (DP
-# carries higher pixel clocks than HDMI on most GPUs) becomes the virtual display.
+# carries higher pixel clocks than HDMI on most GPUs) becomes the virtual display. On i915 the
+# first free HDMI port: a DisplayPort without a sink has no link rate there, i915 keeps only
+# 640x480 on it, while an HDMI port takes the EDID (up to 300 MHz with the HDMI vendor block).
 card_driver() { basename "$(readlink -f "/sys/class/drm/$1/device/driver")"; }
 detect_connector() {
   local best="" best_n=-1 card n c
@@ -135,7 +137,9 @@ detect_connector() {
     [ "$n" -gt "$best_n" ] && { best=$card; best_n=$n; }
   done
   [ -n "$best" ] || return 1
-  for type in DP HDMI-A; do
+  local order="DP HDMI-A"
+  [ "$(card_driver "$best")" = i915 ] && order="HDMI-A DP"
+  for type in $order; do
     for c in $(ls -d /sys/class/drm/"$best"-"$type"-* 2>/dev/null | sort -V); do
       [ "$(cat "$c/status")" = disconnected ] && { basename "$c" | sed "s/^$best-//"; return 0; }
     done
@@ -153,7 +157,7 @@ connector_card() {
 [ -n "$CONNECTOR" ] || CONNECTOR=$(config_connector)
 if [ -z "$CONNECTOR" ]; then
   CONNECTOR=$(detect_connector) || die "no free connector found; pass --connector (see README: Choosing a connector)"
-  say "Virtual display connector: $CONNECTOR (first free DisplayPort of the desktop GPU)"
+  say "Virtual display connector: $CONNECTOR (first free output of the desktop GPU)"
 fi
 if [ -z "$DRIVER" ]; then
   card=$(connector_card "$CONNECTOR") || die "connector $CONNECTOR does not exist on this machine"
@@ -207,7 +211,8 @@ if [ -z "$EDID$MODE" ] && ! sudo test -f "$ETC/edid.bin"; then
 fi
 if [ -n "$MODE" ]; then
   say "Generating the EDID for $MODE"
-  "$REPO/host/make-edid" "$MODE" -o "$tmp/edid.bin"
+  case "$CONNECTOR" in HDMI*) hdmi=--hdmi ;; *) hdmi= ;; esac
+  "$REPO/host/make-edid" "$MODE" $hdmi -o "$tmp/edid.bin"
 elif [ -n "$EDID" ]; then
   cp "$EDID" "$tmp/edid.bin"
   "$REPO/host/make-edid" --decode "$tmp/edid.bin" >/dev/null || die "$EDID is not a valid EDID"

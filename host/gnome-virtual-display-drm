@@ -88,7 +88,12 @@ def connector_dir(conn):
     return found[0][0]
 
 
-def generate(mode):
+def status_dir(d, conn):
+    """sysfs directory of the connector found in debugfs (same card minor)."""
+    return CARDS / f"card{d.parent.name}-{conn}"
+
+
+def generate(mode, hdmi=False):
     m = MODE_RE.match(mode)
     if not m:
         die(f"mode not allowed: {mode}", 2)
@@ -105,7 +110,7 @@ def generate(mode):
     extra = [] if refresh == 60 else [60.0]
     try:
         edid = mod.build(width, height, float(refresh), extra, "Virtual",
-                         (round(width / 200 * 25.4), round(height / 200 * 25.4)))
+                         (round(width / 200 * 25.4), round(height / 200 * 25.4)), hdmi=hdmi)
     except ValueError as e:
         die(str(e))
     tmp = EDID_FILE.with_suffix(".tmp")
@@ -135,7 +140,7 @@ def main():
 
     if action == "on":
         if len(sys.argv) == 4:
-            generate(sys.argv[3])
+            generate(sys.argv[3], hdmi=conn.startswith("HDMI"))
         try:
             edid = EDID_FILE.read_bytes()
         except OSError as e:
@@ -145,11 +150,18 @@ def main():
         write(d, "edid_override", edid)
         write(d, "force", b"on\n")
         write(d, "trigger_hotplug", b"1\n")
+        # i915 only reports the connector connected after a probe made with the force on, and the
+        # debugfs "force" file does not probe. The sysfs status file does, but only when the force
+        # value changes: "detect" first, then "on". Harmless where debugfs was enough (amdgpu).
+        sysfs = status_dir(d, conn)
+        write(sysfs, "status", b"detect\n")
+        write(sysfs, "status", b"on\n")
         print(f"{conn}: EDID injected ({len(edid)} bytes), connector forced on")
         return 0
 
     write(d, "force", b"off\n")
     write(d, "edid_override", b"reset")  # exactly 5 bytes, anything longer is parsed as an EDID
+    write(status_dir(d, conn), "status", b"detect\n")  # clears a force set through sysfs
     write(d, "trigger_hotplug", b"1\n")
     print(f"{conn}: EDID removed, connector released")
     return 0

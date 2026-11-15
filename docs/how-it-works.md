@@ -10,7 +10,11 @@ A GPU output with nothing plugged in can be made to look connected through the k
 /sys/kernel/debug/dri/<card>/<connector>/trigger_hotplug  tell the compositor something changed
 ```
 
-`gnome-virtual-display-drm` (root, called through a narrow sudo rule) writes these three files. It
+`gnome-virtual-display-drm` (root, called through a narrow sudo rule) writes these three files,
+then forces the connector once more through sysfs (`/sys/class/drm/card<N>-<connector>/status`,
+`detect` then `on`). The debugfs `force` file does not probe the connector, and i915 only reports it
+connected after a probe made with the force on; the sysfs file probes, but only when the force value
+changes, hence the two writes. On amdgpu the debugfs files were enough and the extra probe is harmless. It
 only accepts a connector name from a fixed pattern and only reads the EDID from
 `/etc/gnome-virtual-display/edid.bin`, or generates one itself from a `WIDTHxHEIGHT@HZ` it validates.
 The card is found through its connector and kernel driver, never by index: card numbers change when

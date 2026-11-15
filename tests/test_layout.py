@@ -37,6 +37,7 @@ def isolate(module):
     module.STATE_DIR = d
     for name, base in (("MODE_FILE", "mode"), ("LOCK_FILE", "lock"), ("SESSION_FILE", "session"),
                        ("MOUSE_FILE", "mouse"), ("PREFS_FILE", "prefs.json"),
+                       ("DROPPED_FILE", "dropped-modes"),
                        ("XML_WRITTEN", "monitors-xml.sha256"), ("LEGACY_VIRTUAL", "virtual.json")):
         if hasattr(module, name):
             setattr(module, name, os.path.join(d, base))
@@ -164,6 +165,7 @@ def with_virtual_state(scale=1.3333333730697632, transform=gvd.NORMAL, x=864, y=
     # never the real session marker: the watcher would back off
     gvd.SESSION_FILE = os.path.join(tmp, "session")
     gvd.MOUSE_FILE = os.path.join(tmp, "mouse")
+    gvd.DROPPED_FILE = os.path.join(tmp, "dropped-modes")
     gvd.MONITORS_XML = os.path.join(tmp, "monitors.xml")
     gvd.XML_WRITTEN = os.path.join(tmp, "monitors-xml.sha256")
     gvd.load_prefs = _prefs_override
@@ -1221,6 +1223,20 @@ os.environ.update(SUNSHINE_CLIENT_WIDTH="3840", SUNSHINE_CLIENT_HEIGHT="2160", S
 gvd.state = _fake_state_for(3840, 2160, 60)
 check("4K 120 Hz client: falls back to 60 Hz", gvd.match_client_mode("extend"), True)
 check("4K 120 Hz client: 120 refused then 60", [c[1] for c in _calls], ["3840x2160@120", "3840x2160@60"])
+check("refused mode remembered", gvd.read_dropped(), {"DP-2 3840x2160@120"})
+_calls.clear()
+check("4K 120 Hz client again: the 60 Hz EDID is kept", (gvd.match_client_mode("extend"), _calls), (False, []))
+# EDID offering the mode, but the driver dropped it (i915 HDMI: only the 640x480 fallback listed)
+os.environ.update(SUNSHINE_CLIENT_WIDTH="2400", SUNSHINE_CLIENT_HEIGHT="1600", SUNSHINE_CLIENT_FPS="60")
+with open(EDID_FILE, "wb") as _f:
+    _f.write(make_edid(2400, 1600, 60.0, product="Virtual"))
+gvd.state = _fake_state_for(640, 480, 60)
+check("mode dropped by the driver: seen", gvd.mode_dropped(2400, 1600, 60), True)
+_seq = iter([_fake_state_for(640, 480, 60)] * 3 + [_fake_state_for(2400, 1600, 60)] * 50)
+gvd.state = lambda: next(_seq)()
+_calls.clear()
+check("mode dropped by the driver: EDID generated again", gvd.match_client_mode("extend"), True)
+check("mode dropped by the driver: helper called", [c[1] for c in _calls], ["2400x1600@60"])
 _calls.clear()
 gvd.MATCH_CLIENT = False
 os.environ.update(SUNSHINE_CLIENT_WIDTH="1280", SUNSHINE_CLIENT_HEIGHT="720", SUNSHINE_CLIENT_FPS="60")
