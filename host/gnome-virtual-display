@@ -24,8 +24,14 @@ Usage:
   gnome-virtual-display only          # the virtual monitor alone
   gnome-virtual-display remote        # the virtual monitor alone at remote_refresh Hz
   gnome-virtual-display base          # base layout
-  gnome-virtual-display wait MODE     # Sunshine app command: applies MODE, waits for
+  gnome-virtual-display wait MODE     # Sunshine detached command: applies MODE, waits for
                                       # the end of the stream, goes back to base
+  gnome-virtual-display hold          # Sunshine app command: the app stays launched while
+                                      # it runs; `wait` ends it when the stream drops
+  gnome-virtual-display undo          # Sunshine undo: base, or the layout kept for a
+                                      # reconnection after a dropped stream
+  gnome-virtual-display sync-apps     # updates our Sunshine entries (format; Extend only
+                                      # with a physical monitor plugged in)
   gnome-virtual-display rotate R [CONNECTOR]  # rotates a monitor (normal, left, right,
                                       # inverted); default: the first physical monitor
   gnome-virtual-display scale N [CONNECTOR]   # scale (1.0, 1.25, 1.3333, 1.6667, 2.0);
@@ -49,6 +55,8 @@ by $GVD_CONFIG. Every key is optional except `connector`:
   grace           seconds a stream may resume after an abrupt end (90)
   sunshine_unit   Sunshine's systemd user unit (app-dev.lizardbyte.app.Sunshine.service)
   sunshine_log    Sunshine's log file (~/.config/sunshine/sunshine.log)
+  sunshine_apps   Sunshine's apps file (~/.config/sunshine/apps.json)
+  manage_sunshine_apps  keep our entries in that file current (true)
   flat_mouse_during_stream  flat mouse acceleration while streaming (true)
   helper          root helper, run as `sudo -n HELPER on|off CONNECTOR`
                   (/usr/local/sbin/gnome-virtual-display-drm)
@@ -60,10 +68,12 @@ nothing and exit 0: Moonlight streams the login screen, so the password can be
 typed remotely.
 """
 import fcntl
+import glob
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import syslog
@@ -109,6 +119,16 @@ XML_WRITTEN = os.path.join(STATE_DIR, "monitors-xml.sha256")  # hash of the last
 SESSION_FILE = os.path.join(STATE_DIR, "session")
 DROPPED_FILE = os.path.join(STATE_DIR, "dropped-modes")  # "CONNECTOR WxH@R" the driver refused
 MOUSE_FILE = os.path.join(STATE_DIR, "mouse")  # acceleration profile to restore after the stream
+# "TOKEN DEADLINE": `wait` released the app of session TOKEN after a dropped stream; until
+# DEADLINE the layout stays for a reconnection (see cmd_hold, cmd_undo).
+RELEASE_FILE = os.path.join(STATE_DIR, "release")
+HIDDEN_APPS_FILE = os.path.join(STATE_DIR, "hidden-apps.json")  # entries set aside (sync_apps)
+APPS_WRITTEN = os.path.join(STATE_DIR, "apps-written")  # mtime of apps.json when sync_apps wrote it
+# After the end of a dropped stream, wait this long before releasing the app: a Quit reaches
+# Sunshine (/cancel) after the end of the stream, up to 4.6 s later on a real host.
+RELEASE_DELAY = 6
+DRM_SYSFS = "/sys/class/drm"
+DRM_CONF = "/etc/gnome-virtual-display/drm.conf"  # `driver = ...` when the connector name is not unique
 MOUSE_SCHEMA = "org.gnome.desktop.peripherals.mouse"
 LEGACY_VIRTUAL = os.path.join(STATE_DIR, "virtual.json")  # older state file, virtual monitor only
 # One table: "upside_down" is the monitors.xml name, "inverted" the one of
@@ -141,6 +161,9 @@ CONFIG_KEYS = {
     "grace": (90, int),
     "sunshine_unit": ("app-dev.lizardbyte.app.Sunshine.service", str),
     "sunshine_log": ("~/.config/sunshine/sunshine.log", str),
+    "sunshine_apps": ("~/.config/sunshine/apps.json", str),
+    # Keep our entries in apps.json current (sync_apps); install.sh --no-sunshine-config: false.
+    "manage_sunshine_apps": (True, bool),
     "flat_mouse_during_stream": (True, bool),
     "helper": ("/usr/local/sbin/gnome-virtual-display-drm", str),
     # Before each stream, give the virtual monitor the resolution and refresh
@@ -155,7 +178,8 @@ CONNECTOR = KERNEL_CONNECTOR = VIRTUAL_PRODUCT = VIRTUAL_NATIVE = None
 # streams, never does: there the live layout (GNOME Settings) is the truth.
 RESTORE = False
 FALLBACK_SCALE = REMOTE_REFRESH = GRACE = None
-SUNSHINE_UNIT = SUNSHINE_LOG = FLAT_MOUSE = HELPER = None
+SUNSHINE_UNIT = SUNSHINE_LOG = SUNSHINE_APPS = FLAT_MOUSE = HELPER = None
+MANAGE_APPS = True
 MATCH_CLIENT = EDID_PATH = None
 _configured = False
 
@@ -262,7 +286,8 @@ def _validated(settings):
 
 def _apply(values, edid):
     global CONNECTOR, VIRTUAL_PRODUCT, VIRTUAL_NATIVE, FALLBACK_SCALE, REMOTE_REFRESH
-    global GRACE, SUNSHINE_UNIT, SUNSHINE_LOG, FLAT_MOUSE, HELPER, MATCH_CLIENT, EDID_PATH
+    global GRACE, SUNSHINE_UNIT, SUNSHINE_LOG, SUNSHINE_APPS, FLAT_MOUSE, HELPER, MATCH_CLIENT
+    global EDID_PATH, MANAGE_APPS
     global KERNEL_CONNECTOR
     KERNEL_CONNECTOR = values["connector"] or None
     CONNECTOR = mutter_name(KERNEL_CONNECTOR)
@@ -275,6 +300,8 @@ def _apply(values, edid):
     GRACE = values["grace"]
     SUNSHINE_UNIT = values["sunshine_unit"]
     SUNSHINE_LOG = os.path.expanduser(values["sunshine_log"])
+    SUNSHINE_APPS = os.path.expanduser(values["sunshine_apps"])
+    MANAGE_APPS = values["manage_sunshine_apps"]
     FLAT_MOUSE = values["flat_mouse_during_stream"]
     HELPER = os.path.expanduser(values["helper"])
 
@@ -571,6 +598,42 @@ def session_marked(limit=180):
     except ValueError:
         return False
     return time.time() - stamp < limit
+
+
+def write_release(token, deadline):
+    """`wait`: the stream of session `token` dropped, free the app (cmd_hold)
+    and keep the layout until `deadline` (cmd_undo)."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = RELEASE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{token} {deadline:.3f}")
+        os.replace(tmp, RELEASE_FILE)
+    except OSError:
+        pass
+
+
+def read_release():
+    """(token, deadline) written by `wait`, or None."""
+    try:
+        with open(RELEASE_FILE) as f:
+            token, deadline = f.read().split()
+        return token, float(deadline)
+    except (OSError, ValueError):
+        return None
+
+
+def clear_release():
+    try:
+        os.unlink(RELEASE_FILE)
+    except OSError:
+        pass
+
+
+def released_for_grace():
+    """Did `wait` release the current session's app, with its grace period still running?"""
+    release = read_release()
+    return bool(release and release[0] == session_token() and time.time() < release[1])
 
 
 # --- Mutter ---------------------------------------------------------------
@@ -1741,9 +1804,9 @@ def open_sessions(tail):
 def app_engaged():
     """Is our app still "running" for Sunshine?
 
-    The apps only have a `detached` command: for Sunshine the app runs until
-    the client quits it ("Executing Undo Cmd"). Until then, a new click on its
-    tile resumes it, without `prep`.
+    For Sunshine the app runs until the client quits it, or until its `cmd`
+    (`hold`) exits ("Executing Undo Cmd" both times). Until then, a new click
+    on its tile resumes it, without `prep`.
     """
     tail = log_tail()
     if tail is None:
@@ -1753,7 +1816,13 @@ def app_engaged():
         return False
     if PROG not in tail[pos:tail.find("\n", pos)]:
         return False
-    return tail.rfind("Executing Undo Cmd") < pos
+    if tail.rfind("Executing Undo Cmd") > pos:
+        return False
+    # Our `hold` started and is gone: Sunshine frees the app at its next
+    # request (it logs nothing until then).
+    if tail.find(f"Executing: [{PROG} hold]", pos) > 0 and not hold_running():
+        return False
+    return True
 
 
 def session_end(tail):
@@ -1839,8 +1908,18 @@ def wait_running():
     session" and restored base right then: the virtual monitor turned off
     before the capture started and Sunshine streamed the physical monitor.
     """
+    return running("wait")
+
+
+def hold_running():
+    """Is a `gnome-virtual-display hold` running (entries in the current format)?"""
+    return running("hold")
+
+
+def running(subcommand):
+    """Is a `gnome-virtual-display SUBCOMMAND` process running?"""
     for pid in os.listdir("/proc"):
-        if not pid.isdigit():
+        if not pid.isdigit() or int(pid) == os.getpid():
             continue
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
@@ -1848,8 +1927,51 @@ def wait_running():
         except OSError:
             continue
         for i, arg in enumerate(args[:-1]):
-            if os.path.basename(arg) == PROG and args[i + 1] == "wait":
+            if os.path.basename(arg) == PROG and args[i + 1] == subcommand:
                 return True
+    return False
+
+
+def virtual_cards():
+    """DRM cards (card0...) that hold the virtual connector."""
+    cards = []
+    for path in glob.glob(os.path.join(DRM_SYSFS, f"card[0-9]*-{KERNEL_CONNECTOR}")):
+        card = os.path.basename(path).split("-", 1)[0]
+        try:
+            driver = os.path.basename(os.path.realpath(os.path.join(DRM_SYSFS, card, "device", "driver")))
+        except OSError:
+            driver = ""
+        cards.append((card, driver))
+    wanted = None
+    try:
+        with open(DRM_CONF) as f:
+            m = re.search(r'^\s*driver\s*=\s*"?([^"\s]+)"?\s*$', f.read(), re.M)
+            wanted = m[1] if m else None
+    except OSError:
+        pass
+    if wanted and any(d == wanted for _c, d in cards):
+        cards = [(c, d) for c, d in cards if d == wanted]
+    return {c for c, _d in cards}
+
+
+def physical_connected():
+    """Is a physical monitor plugged into the host, on any GPU?
+
+    Read from sysfs, so it also works before the GNOME session (Sunshine starts
+    at boot) and for monitors switched off in GNOME Settings. The virtual
+    connector and the writeback ones do not count.
+    """
+    mine = virtual_cards()
+    for status in glob.glob(os.path.join(DRM_SYSFS, "card[0-9]*-*", "status")):
+        card, conn = os.path.basename(os.path.dirname(status)).split("-", 1)
+        if conn.startswith("Writeback") or (conn == KERNEL_CONNECTOR and card in mine):
+            continue
+        try:
+            with open(status) as f:
+                if f.read().strip() == "connected":
+                    return True
+        except OSError:
+            continue
     return False
 
 
@@ -1926,6 +2048,176 @@ def restart_sunshine():
                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["systemctl", "--user", "restart", SUNSHINE_UNIT],
                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- Sunshine entries -----------------------------------------------------
+
+OUR_PREP_RE = re.compile(r"^\s*gnome-virtual-display\s+prep\s+(\S+)\s*$")
+
+
+def our_mode(app):
+    """MODE of one of our Sunshine entries (`gnome-virtual-display prep MODE`), else None."""
+    if not isinstance(app, dict):
+        return None
+    for cmd in app.get("prep-cmd") or []:
+        m = OUR_PREP_RE.match(str(cmd.get("do", ""))) if isinstance(cmd, dict) else None
+        if m:
+            return normalize_mode(m[1])
+    return None
+
+
+def is_ours(app):
+    """One of the entries the installer wrote (its command, if any, is ours too)."""
+    return bool(our_mode(app)) and (not app.get("cmd") or str(app["cmd"]).strip().startswith(PROG))
+
+
+def current_format(app):
+    """Our entry in the current format, name, image and other keys kept.
+
+    `hold` is the app's command and `wait` a detached one: when a stream
+    drops, `wait` makes `hold` exit, so Sunshine frees the app and the next
+    connection runs `prep` again with that client's mode (a resume would keep
+    the previous client's resolution). `auto-detach` off: an early exit of
+    `hold` must not turn the app into a detached one. An entry whose `cmd` is
+    someone else's is left as it is.
+    """
+    if not is_ours(app):
+        return app
+    mode = our_mode(app)
+    new = dict(app)
+    new["cmd"] = f"{PROG} hold"
+    new["auto-detach"] = False
+    others = [c for c in app.get("detached") or [] if not str(c).strip().startswith(f"{PROG} wait")]
+    new["detached"] = others + [f"{PROG} wait {mode}"]
+    new["prep-cmd"] = [dict(c, undo=f"{PROG} undo")
+                       if isinstance(c, dict) and OUR_PREP_RE.match(str(c.get("do", ""))) else c
+                       for c in app.get("prep-cmd") or []]
+    return new
+
+
+def load_hidden():
+    try:
+        with open(HIDDEN_APPS_FILE) as f:
+            hidden = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [h for h in hidden if isinstance(h, dict) and isinstance(h.get("index"), int)
+            and is_ours(h.get("app"))] if isinstance(hidden, list) else []
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def sync_apps(write=True, physical=None):
+    """Keeps our entries in Sunshine's apps.json current. -> True if apps.json changes.
+
+    - Format: see current_format (entries written by an older install).
+    - Extend only when a physical monitor is plugged in: without one there is
+      nothing to extend. The entry is set aside as it is, with its place in the
+      list, and put back when a monitor comes back.
+
+    Sunshine reads apps.json when it starts: `reapply` (run before it starts)
+    calls this, and the watcher restarts Sunshine between streams after a
+    change.
+    """
+    if not MANAGE_APPS:
+        return False
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(HIDDEN_APPS_FILE + ".lock", "a+") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        return _sync_apps(write, physical)
+
+
+def _sync_apps(write, physical):
+    try:
+        with open(SUNSHINE_APPS) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    apps = data.get("apps") if isinstance(data, dict) else None
+    if not isinstance(apps, list):
+        return False
+    before = json.dumps(apps, sort_keys=True)
+    hidden = load_hidden()
+    hidden_before = json.dumps(hidden, sort_keys=True)
+    apps = [current_format(a) for a in apps]
+    hidden = [dict(h, app=current_format(h["app"])) for h in hidden]
+    if physical is None:
+        physical = physical_connected()
+    if not physical:
+        kept = []
+        for i, app in enumerate(apps):
+            if is_ours(app) and our_mode(app) == "extend":
+                # The same entry set aside twice (written again meanwhile): the latest wins.
+                hidden = [h for h in hidden if h["app"].get("name") != app.get("name")]
+                hidden.append({"index": i, "app": app})
+            else:
+                kept.append(app)
+        apps = kept
+    elif hidden:
+        names = {a.get("name") for a in apps if isinstance(a, dict)}
+        for h in sorted(hidden, key=lambda h: h["index"]):
+            if h["app"].get("name") not in names:
+                apps.insert(min(h["index"], len(apps)), h["app"])
+                names.add(h["app"].get("name"))
+        hidden = []
+    changed = json.dumps(apps, sort_keys=True) != before
+    if write:
+        # The entries set aside first: a failure in between never loses one.
+        if json.dumps(hidden, sort_keys=True) != hidden_before:
+            write_json(HIDDEN_APPS_FILE, hidden)
+        if changed:
+            data["apps"] = apps
+            write_json(SUNSHINE_APPS, data)
+            with open(APPS_WRITTEN, "w") as f:
+                f.write(repr(os.path.getmtime(SUNSHINE_APPS)))
+    return changed
+
+
+def sunshine_started_at():
+    """When the running Sunshine started (epoch seconds), or None."""
+    r = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value", SUNSHINE_UNIT],
+                       capture_output=True, text=True)
+    pid = r.stdout.strip()
+    if not pid.isdigit() or pid == "0":
+        return None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            boot = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    return boot + ticks / os.sysconf("SC_CLK_TCK")
+
+
+def apps_stale():
+    """Did sync_apps write apps.json after Sunshine read it (a manual `sync-apps`, the
+    installer during a stream)? Sunshine then still lists the old entries. A write by
+    Sunshine's own web UI does not count: Sunshine reloads those itself."""
+    if not MANAGE_APPS:
+        return False
+    try:
+        with open(APPS_WRITTEN) as f:
+            ours = float(f.read())
+        written = os.path.getmtime(SUNSHINE_APPS)
+    except (OSError, ValueError):
+        return False
+    started = sunshine_started_at()
+    return written == ours and started is not None and written > started + 1
+
+
+def cmd_sync_apps():
+    """Updates our Sunshine entries now (format, Extend); Sunshine needs a restart to see it."""
+    changed = sync_apps()
+    print("Sunshine entries updated: restart Sunshine to load them" if changed
+          else "Sunshine entries up to date", flush=True)
+    return 0
 
 
 # --- commands -------------------------------------------------------------
@@ -2112,28 +2404,48 @@ def cmd_wait(mode="extend"):
     finally:
         unlock(guard)
 
-    # Wait for the end of the session: three negative reads in a row (~6 s),
-    # so as not to react to a rotation of Sunshine's log. Clean end (the client
-    # quit the app, Sunshine ran the `undo`): base at once. Abrupt end: keep
-    # the stream layout for GRACE seconds, long enough for a resume, then base
-    # and a Sunshine restart to free the app.
-    closed, ended, release = 0, None, False
+    # Wait for the end of the session. An end written in the log after a
+    # session seen open counts at once; otherwise three negative reads in a row
+    # (a rotation of Sunshine's log, a client that has not connected yet).
+    # Clean end (the client quit the app, Sunshine ran the `undo`): base at
+    # once. Dropped stream: the app is released (`hold` exits, Sunshine frees
+    # it), so a reconnection launches it again with `prep` and its own mode,
+    # and the layout stays GRACE seconds for it. Entries of an older format
+    # (no `hold`): the layout stays GRACE seconds, then base and a Sunshine
+    # restart to free the app.
+    seen, closed, ended, released = False, 0, None, False
     while True:
-        time.sleep(2)
+        time.sleep(1)
         if session_token() != token:
             print("a newer stream took over", flush=True)
             return 0
-        if stream_open():
+        tail = log_tail()
+        if tail is None or open_sessions(tail) > 0:
+            seen = seen or tail is not None
             closed, ended = 0, None
+            if released:
+                # Back before Sunshine freed the app (a resume): it goes on.
+                clear_release()
+                released = False
             continue
-        closed += 1
+        closed = 3 if seen and ended_in_log(tail) else closed + 1
         if closed < 3:
             continue
         ended = ended or time.time()
-        if not app_engaged():
-            break
+        if not released:
+            if not app_engaged():
+                break
+            if seen and hold_running():
+                # A Quit reaches Sunshine (/cancel) a few seconds after the end
+                # of the stream (up to 4.6 s seen): released earlier, its
+                # `undo` would keep the layout instead of restoring base.
+                if time.time() - ended < RELEASE_DELAY:
+                    continue
+                write_release(token, ended + GRACE)
+                released = True
+                print("stream dropped: app released, layout kept for a reconnection", flush=True)
+                continue
         if time.time() - ended >= GRACE:
-            release = True
             break
 
     guard = lock()
@@ -2141,8 +2453,9 @@ def cmd_wait(mode="extend"):
         if session_token() != token:
             return 0
         print("session ended: base layout", flush=True)
+        clear_release()
         cmd_base()
-        if release and app_engaged() and not stream_open():
+        if not released and app_engaged() and not stream_open():
             print(f"no resume within {GRACE} s: Sunshine restarted to free the app", flush=True)
             journal(f"wait: no resume within {GRACE} s, Sunshine restarted to free the app")
             restart_sunshine()
@@ -2151,12 +2464,67 @@ def cmd_wait(mode="extend"):
     return 0
 
 
+def ended_in_log(tail):
+    """Does the log end with the end of a session (and nothing open after it)?"""
+    start = max(tail.rfind("New streaming session started"), tail.rfind("CLIENT CONNECTED"))
+    return start >= 0 and session_end(tail) > start
+
+
+def cmd_hold():
+    """Sunshine `cmd` of our entries: the app stays launched while it runs.
+
+    When a stream drops, `wait` writes the release file: `hold` exits once no
+    session is open (Sunshine ends the open sessions when the app's command
+    exits), Sunshine frees the app and runs the `undo`. The next connection
+    then launches the app again, `prep` included: a resume would have kept
+    the previous client's resolution. A Quit from the client stops it through
+    Sunshine (SIGTERM).
+    """
+    signal.signal(signal.SIGTERM, hold_stopped)
+    while True:
+        time.sleep(0.4)
+        release = read_release()
+        if not release or release[0] != session_token():
+            continue
+        tail = log_tail()
+        if tail is not None and open_sessions(tail) == 0:
+            return 0
+
+
+def hold_stopped(*_a):
+    """SIGTERM of `hold`: Sunshine stops it only to end the app (Quit, Sunshine
+    stopping). Its `undo` must then restore base, not keep the layout."""
+    release = read_release()
+    if release and release[0] == session_token():
+        clear_release()
+    sys.exit(0)
+
+
+def cmd_undo():
+    """Sunshine `undo`: base layout, unless `wait` released the app after a dropped stream.
+
+    Then the layout stays until the end of the grace period (`wait` restores
+    base, or a reconnection's `prep` takes over). Sunshine may run it late,
+    at the next request of a client: it is harmless then (base already, or a
+    grace period still running).
+    """
+    if released_for_grace():
+        print("dropped stream: layout kept for a reconnection", flush=True)
+        return 0
+    return cmd_base()
+
+
 def cmd_reapply():
     """Reapplies the current mode (called when Sunshine starts).
 
     Never changes the mode: it reads `mode` and restores it. Never exits with
-    an error, so as not to keep Sunshine from starting.
+    an error, so as not to keep Sunshine from starting. Before Sunshine starts
+    it also updates our entries in apps.json (sync_apps).
     """
+    try:
+        sync_apps()
+    except (Exception, SystemExit) as e:
+        print(f"reapply: apps.json: {e}", file=sys.stderr)
     guard = lock(wait=False)
     if guard is None:
         return 0  # another command holds the lock
@@ -2185,6 +2553,7 @@ def cmd_prep(mode="extend"):
     """
     mode = normalize_mode(mode)
     mark_session()
+    clear_release()
     target = mode if mode in ("only", "remote") else "extend"
 
     def before():
@@ -2565,6 +2934,17 @@ def cmd_watch():
                 cmd_base()
                 mode = "base"
 
+            # A physical monitor plugged in or unplugged: Extend shown or
+            # hidden in Moonlight (Sunshine reads apps.json when it starts).
+            if not app_engaged() and (sync_apps(write=False) or apps_stale()) and can_restart():
+                sync_apps()
+                print("Moonlight entries updated (physical monitor plugged or unplugged): "
+                      "Sunshine restarted", flush=True)
+                unlock(guard)
+                guard = None
+                restart_sunshine()
+                return False
+
             # And if Sunshine stayed stuck with the app running, it would skip
             # the `prep-cmd` on the next stream: restart it once. Without
             # waiting for that failed stream when `wait` is no longer there to
@@ -2583,9 +2963,11 @@ def cmd_watch():
             if mode != "base" and (mirrored(logical) or settled(mode, monitors, logical)):
                 if repair(mode):
                     print("layout fixed", flush=True)
-            elif mode == "base" and (active() or base_layout(monitors, logical)):
+            elif mode == "base" and ((active() and any(not is_virtual(m) for m in monitors))
+                                     or base_layout(monitors, logical)):
                 # The virtual monitor is still on outside a stream: switch it
                 # off (the physical monitors get their remembered layout back).
+                # Without a physical monitor it is the only screen and stays.
                 if repair("base"):
                     print("base layout restored", flush=True)
             elif mode == "base" and not mirrored(logical):
@@ -2676,8 +3058,8 @@ def usage():
 # Actions that take the lock before running. `reapply` takes it without
 # waiting (cmd_reapply); the others do not take it here.
 LOCKED_ACTIONS = ("extend", "on", "only", "remote", "base", "off", "wait", "prep",
-                  "boot", "scale", "rotate")
-UNLOCKED_ACTIONS = ("list", "watch", "fix-session", "reapply")
+                  "boot", "scale", "rotate", "undo")
+UNLOCKED_ACTIONS = ("list", "watch", "fix-session", "reapply", "hold", "sync-apps")
 
 
 def main(argv):
@@ -2709,6 +3091,12 @@ def main(argv):
         return cmd_base()
     if action == "wait":
         return cmd_wait(argv[2] if len(argv) > 2 else "extend")
+    if action == "hold":
+        return cmd_hold()
+    if action == "undo":
+        return cmd_undo()
+    if action == "sync-apps":
+        return cmd_sync_apps()
     if action == "reapply":
         return cmd_reapply()
     if action == "prep":
@@ -2738,7 +3126,7 @@ def run(argv):
         action = " ".join(argv[1:]) or "list"
         print(e, file=sys.stderr)
         if isinstance(e, NoSession) and argv[1:2] and argv[1] in (
-                "prep", "wait", "base", "reapply"):
+                "prep", "wait", "base", "undo", "reapply"):
             # Login screen: Sunshine streams the physical monitor, so the user
             # can log in remotely. A failure here would block the stream.
             journal(f"{action}: {e}: physical monitor streamed as is")

@@ -79,23 +79,24 @@ set_key() {
   fi
 }
 
-# What moonlight-lan did, for the extension: "KIND X Y PID LAUNCHER". `flatpak run` keeps this
-# PID, Moonlight's windows are its descendants. No file: the extension leaves Moonlight alone.
+# What moonlight-lan did, for the extension: "KIND CONNECTOR PID LAUNCHER" (KIND gui or stream,
+# CONNECTOR the screen whose mode Moonlight got). `flatpak run` keeps this PID: Moonlight's
+# windows are its descendants. No file: the extension leaves Moonlight alone.
 note_screen() {
   if [ $# -eq 0 ]; then
     rm -f "$STATE"
   else
-    printf '%s %s %s %s %s\n' "$1" "$2" "$3" "$$" "$SELF" > "$STATE"
+    printf '%s %s %s %s\n' "$1" "$2" "$$" "$SELF" > "$STATE"
   fi
 }
 
 match_screen() {
   note_screen
   [ "$MATCH_SCREEN" = 0 ] && return 0
-  local mode w h fps x y a res="" fps_given="" rate_given="" auto=1 rate=""
+  local mode w h fps screen a res="" fps_given="" rate_given="" auto=1 rate=""
   mode=$(python3 "$(dirname "$SELF")/moonlight-screen" 2>/dev/null)
-  read -r w h fps x y <<< "$mode"
-  [ -n "$y" ] || return 0  # no extension: Moonlight's own settings
+  read -r w h fps screen <<< "$mode"
+  [ -n "$screen" ] || return 0  # no extension: Moonlight's own settings
   if [ -f "$ML_CONF" ]; then
     grep -qx 'autoadjustbitrate=false' "$ML_CONF" && auto=0
     rate=$(sed -n 's/^bitrate=\([0-9][0-9]*\)$/\1/p' "$ML_CONF" | head -1)
@@ -108,7 +109,7 @@ match_screen() {
         --bitrate|--bitrate=*) rate_given=1 ;;
       esac
     done
-    note_screen stream "$x" "$y"
+    note_screen stream "$screen"
     [ -n "$res" ] && [ -n "$fps_given" ] && return 0
     [ -n "$res" ] || ARGS+=(--resolution "${w}x$h")
     [ -n "$fps_given" ] || ARGS+=(--fps "$fps")
@@ -124,7 +125,7 @@ match_screen() {
     set_key fps "$fps"
     # Without a saved bitrate Moonlight takes its default for the new mode.
     [ "$auto" = 1 ] && sed -i '/^bitrate=/d' "$ML_CONF"
-    note_screen gui "$x" "$y"
+    note_screen gui "$screen"
   fi
 }
 

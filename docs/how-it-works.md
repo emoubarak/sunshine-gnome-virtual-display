@@ -67,19 +67,38 @@ Rules the tool keeps:
 2. Moonlight opens an entry. Sunshine runs `prep MODE`: it marks the session, writes a new EDID when
    `match_client` is on and the current one lacks the client's mode (from `SUNSHINE_CLIENT_WIDTH`,
    `_HEIGHT`, `_FPS`), and applies the mode. Sunshine then captures the connector through KMS.
-3. `wait MODE` runs as the app's detached command. It counts the open sessions in Sunshine's log
-   (or journal): a client that reconnects before its old session timed out has two for a moment, and
-   the old one's timeout must not end the new one.
-4. **Clean end** (the client quits the app): Sunshine runs `base`, and `wait` sees it and exits.
-   **Dropped stream** (Wi-Fi lost, client killed): Sunshine runs nothing. `wait` keeps the virtual
-   layout for `grace` seconds so a reconnection lands on the right screen, then restores the base
-   layout and restarts Sunshine to free the app (otherwise the next stream skips `prep` and captures a
-   physical monitor).
+3. `wait MODE` runs as the app's detached command and `hold` as its command: while `hold` runs,
+   Sunshine keeps the app launched. `wait` counts the open sessions in Sunshine's log (or journal):
+   a client that reconnects before its old session timed out has two for a moment, and the old
+   one's timeout must not end the new one.
+4. **Clean end** (the client quits the app): Sunshine stops `hold` and runs `undo`: base at once.
+   **Dropped stream** (Wi-Fi lost, client killed, stream window closed without quitting): 6 s after
+   Sunshine logs the end (a Quit reaches Sunshine up to about 5 s after the end of its stream, and
+   must still restore base), `wait` releases the app. `hold` exits once no session is open (Sunshine
+   ends the open sessions when the app's command exits), Sunshine frees the app and runs `undo`,
+   which keeps the virtual layout for `grace` seconds. A reconnection in that time is a new launch:
+   `prep` runs with that client's resolution on the layout still in place. Sunshine runs no command
+   on a resume, so a resumed app would keep the previous client's resolution (a laptop that moved
+   its Moonlight window from a 16:9 monitor to its 3:2 panel would get black bars). Without a
+   reconnection, `wait` restores base. Entries written by an older install (no `hold`) keep the
+   old behaviour, base and a Sunshine restart after the grace period, until `./install.sh` or
+   `gnome-virtual-display sync-apps` updates them.
 5. A newer stream wins: `prep` and `wait` share a session token, and an old `wait` whose token was
    replaced leaves without touching the layout.
 
 `base` switches the virtual monitor off but leaves the connector plugged: an unplug and replug cycle
-under a running gnome-shell has crashed it.
+under a running gnome-shell has crashed it. On a host with no physical monitor the virtual one is
+the only screen: base keeps it on.
+
+## Moonlight entries
+
+`sync-apps` (also run by `reapply` before Sunshine starts, and by the installer) keeps our entries
+in Sunshine's `apps.json` current: the format above, matched on their `prep` command so that
+renamed entries are updated too, and **Extend** only when a physical monitor is plugged in (read
+from sysfs, every GPU, the virtual connector left out). A hidden Extend is set aside as it is, with
+its place in the list, in `~/.local/state/gnome-virtual-display/hidden-apps.json`. Sunshine reads
+`apps.json` when it starts: after a monitor is plugged or unplugged, the watcher restarts it between
+streams.
 
 ## The watcher
 

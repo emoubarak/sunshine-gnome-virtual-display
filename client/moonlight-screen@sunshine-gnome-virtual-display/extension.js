@@ -5,11 +5,13 @@
 // the other screen gets black bars. This extension works with client/moonlight-lan:
 //   - PointerMonitor() over D-Bus: the screen under the pointer, where Mutter opens a new window.
 //     moonlight-lan gives Moonlight that screen's mode before starting it, and writes what it did
-//     in $XDG_RUNTIME_DIR/moonlight-lan.screen: "gui X Y PID LAUNCHER" (PID: its own, which
-//     `flatpak run` keeps, so Moonlight's windows are its descendants).
-//   - The main window of that start is kept on that screen. When it is moved to another screen
-//     (drag, Super+Shift+arrow) and no stream is running, Moonlight is closed and started again
-//     through moonlight-lan with MOONLIGHT_SCREEN="X,Y", and its new window put on that screen.
+//     in $XDG_RUNTIME_DIR/moonlight-lan.screen: "gui CONNECTOR PID LAUNCHER" (PID: its own,
+//     which `flatpak run` keeps, so Moonlight's windows are its descendants).
+//   - The main window of that start is kept on that screen (found by its connector: plugging or
+//     unplugging another screen moves the others, it is not a move). When the window is moved
+//     to another screen (drag, Super+Shift+arrow), or its screen is unplugged, and no stream is
+//     running, Moonlight is closed and started again through moonlight-lan with
+//     MOONLIGHT_SCREEN="X,Y" (the new screen's position), and its new window put on that screen.
 // Windows(): debug list of the windows. Logs: journalctl -b /usr/bin/gnome-shell | grep moonlight
 
 import GLib from 'gi://GLib';
@@ -57,13 +59,9 @@ function moonlightWindows() {
         .filter(win => win && isMoonlight(win));
 }
 
-function monitorAt(x, y) {
-    for (let i = 0; i < global.display.get_n_monitors(); i++) {
-        const r = global.display.get_monitor_geometry(i);
-        if (r.x === x && r.y === y)
-            return i;
-    }
-    return -1;
+// Index of the screen on that connector, -1 when it is not there (unplugged, switched off).
+function monitorOf(connector) {
+    return global.backend.get_monitor_manager().get_monitor_for_connector(connector);
 }
 
 function parentPid(pid) {
@@ -88,8 +86,8 @@ function readState() {
     const path = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'moonlight-lan.screen']);
     try {
         const [, bytes] = GLib.file_get_contents(path);
-        const [kind, x, y, pid, ...launcher] = new TextDecoder().decode(bytes).trim().split(' ');
-        return {kind, x: parseInt(x), y: parseInt(y), pid: parseInt(pid), launcher: launcher.join(' ')};
+        const [kind, connector, pid, ...launcher] = new TextDecoder().decode(bytes).trim().split(' ');
+        return {kind, connector, pid: parseInt(pid), launcher: launcher.join(' ')};
     } catch {
         return null;
     }
@@ -190,11 +188,16 @@ export default class MoonlightScreenExtension extends Extension {
             win.connect('unmanaged', () => this._untrack(win)),
         ];
         this._windows.set(win, rec);
-        const target = monitorAt(state.x, state.y);
+        const target = monitorOf(state.connector);
+        if (existing || win.get_monitor() === target)
+            return;
         // Its settings are for that screen: a new window opens under the pointer, possibly on
         // another one (start after Super+Shift+arrow, main window shown again after a stream).
-        if (!existing && target >= 0 && win.get_monitor() !== target)
+        // That screen gone: like a move.
+        if (target >= 0)
             win.move_to_monitor(target);
+        else
+            this._schedule(win);
     }
 
     _untrack(win) {
@@ -235,10 +238,9 @@ export default class MoonlightScreenExtension extends Extension {
         const windows = moonlightWindows();
         if (windows.length !== 1 || windows[0] !== win || windows.some(isStream))
             return;  // a stream is running, or another Moonlight is open
-        const r = global.display.get_monitor_geometry(win.get_monitor());
-        if (r.x === rec.state.x && r.y === rec.state.y)
+        if (win.get_monitor() === monitorOf(rec.state.connector))
             return;
-        this._relaunch(win, rec, r);
+        this._relaunch(win, rec, global.display.get_monitor_geometry(win.get_monitor()));
     }
 
     _relaunch(win, rec, r) {

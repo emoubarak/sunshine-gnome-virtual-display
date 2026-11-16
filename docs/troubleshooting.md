@@ -16,7 +16,9 @@ Start with `gnome-virtual-display list` (outputs, modes, layout) and the logs:
 ## The stream shows a physical monitor instead of the virtual one
 
 Sunshine skipped the `prep` command because it still believed the previous app was running (the
-client vanished without quitting). The watcher restarts Sunshine between sessions when it sees this;
+client vanished without quitting). Entries in the current format free the app as soon as the stream
+drops (`gnome-virtual-display sync-apps` updates older ones, then restart Sunshine). The watcher
+also restarts Sunshine between sessions when it sees this;
 to do it at once: `systemctl --user restart <sunshine unit>`. Enable "Quit app on host PC after ending
 stream" in Moonlight to make clean ends the norm.
 

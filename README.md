@@ -30,6 +30,14 @@ screen of the host, then get your desk back exactly as it was when the stream en
 | **Virtual only** | the virtual monitor alone, your physical monitors off; the host desktop is exactly the client's screen |
 | **Remote** | the virtual monitor alone at 60 Hz, for streams over the internet (lower the bitrate and frame rate in the client) |
 
+**Extend** is only listed when a physical monitor is plugged into the host: without one there is
+nothing to extend. It comes back by itself when a monitor is plugged in (Sunshine is restarted
+between streams to load the change).
+
+Each connection takes the resolution and refresh rate of the client that opens it, also right
+after a dropped stream: a client that comes back from another screen (a laptop moved from its
+monitor to its own panel) gets its new resolution, on the layout kept for the reconnection.
+
 ## Requirements
 
 - GNOME on Wayland (tested with GNOME 50).
@@ -141,8 +149,8 @@ gnome-virtual-display rotate left DP-1
 ## Commands
 
 `gnome-virtual-display list | extend | only | remote | base | scale N [OUTPUT] | rotate R [OUTPUT] |
-off | fix-session`. The Sunshine entries use `prep MODE`, `wait MODE` and `base`; the user service
-runs `boot` and `watch`. Logs: `journalctl -t gnome-virtual-display` and `journalctl -t stream-qos`.
+off | fix-session | sync-apps`. The Sunshine entries use `prep MODE`, `wait MODE`, `hold` and
+`undo`; the user service runs `boot` and `watch`, and Sunshine `reapply` when it starts. Logs: `journalctl -t gnome-virtual-display` and `journalctl -t stream-qos`.
 
 ## Uninstall
 

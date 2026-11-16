@@ -28,6 +28,10 @@ grace = 90
 sunshine_unit = "app-dev.lizardbyte.app.Sunshine.service"
 sunshine_log = "~/.config/sunshine/sunshine.log"
 
+# Keep our Moonlight entries in Sunshine's apps.json current: their format after an update, and
+# Extend listed only when a physical monitor is plugged in. install.sh --no-sunshine-config: false.
+manage_sunshine_apps = true
+
 # Turn GNOME's mouse acceleration off during a stream: the client already accelerates the pointer,
 # accelerating it twice makes it faster than on the client. Restored after the stream.
 flat_mouse_during_stream = true

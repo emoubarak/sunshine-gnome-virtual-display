@@ -10,12 +10,14 @@
       "prep-cmd": [
         {
           "do": "gnome-virtual-display prep extend",
-          "undo": "gnome-virtual-display base"
+          "undo": "gnome-virtual-display undo"
         }
       ],
       "detached": [
         "gnome-virtual-display wait extend"
-      ]
+      ],
+      "cmd": "gnome-virtual-display hold",
+      "auto-detach": false
     },
     {
       "name": "Virtual only",
@@ -24,12 +26,14 @@
       "prep-cmd": [
         {
           "do": "gnome-virtual-display prep only",
-          "undo": "gnome-virtual-display base"
+          "undo": "gnome-virtual-display undo"
         }
       ],
       "detached": [
         "gnome-virtual-display wait only"
-      ]
+      ],
+      "cmd": "gnome-virtual-display hold",
+      "auto-detach": false
     },
     {
       "name": "Remote",
@@ -38,12 +42,14 @@
       "prep-cmd": [
         {
           "do": "gnome-virtual-display prep remote",
-          "undo": "gnome-virtual-display base"
+          "undo": "gnome-virtual-display undo"
         }
       ],
       "detached": [
         "gnome-virtual-display wait remote"
-      ]
+      ],
+      "cmd": "gnome-virtual-display hold",
+      "auto-detach": false
     }
   ]
 }

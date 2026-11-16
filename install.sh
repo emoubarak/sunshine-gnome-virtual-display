@@ -268,6 +268,13 @@ else
   sed -i -E "s/^[[:space:]]*connector[[:space:]]*=.*/connector = \"$CONNECTOR\"/" "$CONF_DIR/config.toml"
   [ -z "$EDID$MODE" ] || sed -i -E "s/^[[:space:]]*match_client[[:space:]]*=.*/match_client = false/" "$CONF_DIR/config.toml"
 fi
+# --no-sunshine-config: apps.json is never touched, not even later by `reapply` or the watcher.
+MANAGE=$([ $SUNSHINE_CONFIG = 1 ] && echo true || echo false)
+if grep -qE '^[[:space:]]*manage_sunshine_apps[[:space:]]*=' "$CONF_DIR/config.toml"; then
+  sed -i -E "s/^[[:space:]]*manage_sunshine_apps[[:space:]]*=.*/manage_sunshine_apps = $MANAGE/" "$CONF_DIR/config.toml"
+else
+  printf '\n# Keep our Moonlight entries in apps.json current (install.sh --no-sunshine-config: false).\nmanage_sunshine_apps = %s\n' "$MANAGE" >> "$CONF_DIR/config.toml"
+fi
 
 say "Installing user units"
 sed "s/@CONNECTOR@/$CONNECTOR/g" "$REPO/systemd/user/gnome-virtual-display-session-end.service" \
@@ -338,6 +345,8 @@ else:
 json.dump(current, open(apps_file, "w"), indent=2)
 print("  apps added:", ", ".join(a["name"] for a in added) or "none (already there)")
 EOF
+  # Entries of an older install in the current format, Extend hidden without a physical monitor.
+  "$BIN/gnome-virtual-display" sync-apps | sed 's/^/  /' || true
   last=$(grep -hoE 'CLIENT (DIS)?CONNECTED' "$SUN_DIR/sunshine.log" 2>/dev/null | tail -1 || true)
   if [ "$last" = "CLIENT CONNECTED" ]; then
     say "A stream is running: restart Sunshine after it to load the new settings"

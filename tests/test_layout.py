@@ -37,7 +37,8 @@ def isolate(module):
     module.STATE_DIR = d
     for name, base in (("MODE_FILE", "mode"), ("LOCK_FILE", "lock"), ("SESSION_FILE", "session"),
                        ("MOUSE_FILE", "mouse"), ("PREFS_FILE", "prefs.json"),
-                       ("DROPPED_FILE", "dropped-modes"),
+                       ("DROPPED_FILE", "dropped-modes"), ("RELEASE_FILE", "release"),
+                       ("HIDDEN_APPS_FILE", "hidden-apps.json"), ("APPS_WRITTEN", "apps-written"),
                        ("XML_WRITTEN", "monitors-xml.sha256"), ("LEGACY_VIRTUAL", "virtual.json")):
         if hasattr(module, name):
             setattr(module, name, os.path.join(d, base))
@@ -54,6 +55,9 @@ gvd.restart_sunshine = _forbidden
 gvd.gsettings = _forbidden
 gvd.xwayland_frozen = _forbidden
 gvd.sunshine_journal = lambda *a, **k: None  # never the real journal
+# Never Sunshine's real apps.json nor the host's sysfs (tests/test_session.py covers them).
+gvd.sync_apps = lambda *a, **k: False
+gvd.physical_connected = lambda: True
 _journal = []
 gvd.journal = _journal.append  # never the real syslog
 isolate(gvd)

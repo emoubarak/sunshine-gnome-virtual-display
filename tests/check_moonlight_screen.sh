@@ -86,6 +86,23 @@ def activate(a):
 app.connect('activate', activate)
 app.run([])
 EOF
+cat > "$T/layout.py" <<'EOF'
+# layout.py swap | off1 | both: rearranges the two headless screens through Mutter
+import sys
+from gi.repository import Gio, GLib
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+def call(method, args=None):
+    return bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                         "org.gnome.Mutter.DisplayConfig", method, args, None, 0, 5000, None).unpack()
+serial, monitors, logical, _ = call("GetCurrentState")
+mode = {m[0][0]: next(x[0] for x in m[1] if x[6].get("is-current") or x[6].get("is-preferred"))
+        for m in monitors}
+big, small = (m[0][0] for m in sorted(monitors, key=lambda m: -m[1][0][1]))
+wanted = {"swap": [(0, 0, small), (1920, 0, big)], "off1": [(0, 0, big)],
+          "both": [(0, 0, big), (2400, 0, small)]}[sys.argv[1]]
+config = [(x, y, 1.0, 0, i == 0, [(conn, mode[conn], {})]) for i, (x, y, conn) in enumerate(wanted)]
+call("ApplyMonitorsConfig", GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})", (serial, 1, config, {})))
+EOF
 cat > "$T/bin/flatpak" <<EOF
 #!/bin/bash
 shift 2  # run com.moonlight_stream.Moonlight
@@ -119,7 +136,7 @@ warp() {
   done
 }
 conf() { grep -E '^(width|height|fps)=' "$ML" | tr '\n' ' '; }
-state() { cut -d' ' -f1-3 "$RT/moonlight-lan.screen" 2>/dev/null; }
+state() { cut -d' ' -f1-2 "$RT/moonlight-lan.screen" 2>/dev/null; }
 # "monitor[,fullscreen][,tracked]" for each Moonlight window
 windows() {
   E Windows | python3 -c 'import ast, json, sys
@@ -133,12 +150,14 @@ for _ in $(seq 60); do E PointerMonitor > /dev/null 2>&1 && break; sleep 0.5; do
 check "extension loaded" "$(E PointerMonitor 2>&1)" "(0, 0, 2400, 1600)"
 
 warp 3000 500
-check "pointer on the 1920x1080 screen" "$(python3 "$REPO/client/moonlight-screen")" "1920 1080 60 2400 0"
+SMALL=$(python3 "$REPO/client/moonlight-screen" | cut -d' ' -f4)
+BIG=$(MOONLIGHT_SCREEN=0,0 python3 "$REPO/client/moonlight-screen" | cut -d' ' -f4)
+check "pointer on the 1920x1080 screen" "$(python3 "$REPO/client/moonlight-screen")" "1920 1080 60 $SMALL"
 
 "$REPO/client/moonlight-lan" > /dev/null 2>&1 &
 sleep 4
 check "plain start: settings" "$(conf)" "fps=60 height=1080 width=1920 "
-check "plain start: screen" "$(state)" "gui 2400 0"
+check "plain start: screen" "$(state)" "gui $SMALL"
 check "plain start: window" "$(windows)" "1,tracked"
 
 H Move 0 > /dev/null  # like Super+Shift+arrow: the pointer stays on the other screen
@@ -146,6 +165,27 @@ sleep 9
 check "moved: Moonlight started again" "$(wc -l < "$FAKE_LOG")" "2"
 check "moved: settings" "$(conf)" "fps=120 height=1600 width=2400 "
 check "moved: window on the new screen" "$(windows)" "0,tracked"
+
+: > "$FAKE_LOG"
+python3 "$T/layout.py" swap  # both screens change position, Moonlight stays on its own
+sleep 5
+check "screens rearranged: Moonlight not started again" "$(wc -l < "$FAKE_LOG")" "0"
+check "screens rearranged: still tracked" "$(windows | sed 's/^[0-9]*,//')" "tracked"
+python3 "$T/layout.py" both
+sleep 3
+quit_fake
+
+warp 3000 500
+: > "$FAKE_LOG"
+"$REPO/client/moonlight-lan" > /dev/null 2>&1 &
+sleep 4
+python3 "$T/layout.py" off1  # its screen switched off (unplugged): Moonlight lands on the other
+sleep 7
+check "screen unplugged: Moonlight started again" "$(wc -l < "$FAKE_LOG")" "2"
+check "screen unplugged: settings of the remaining screen" "$(conf)" "fps=120 height=1600 width=2400 "
+check "screen unplugged: screen file" "$(state)" "gui $BIG"
+python3 "$T/layout.py" both
+sleep 3
 quit_fake
 
 warp 1000 500
