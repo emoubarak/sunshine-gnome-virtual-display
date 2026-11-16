@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Client with two screens</title>
+<style>html, body { margin: 0; background: #0e151c; } svg { display: block; }</style>
+<body>
+<script src="common.js"></script>
+<script>
+// README, client section: a GNOME client with a 1920x1080 monitor and a 2400x1600 panel.
+// Moonlight alone streams one resolution everywhere (black bars); with moonlight-lan and its
+// extension the stream takes the mode of the screen Moonlight is on, and moving Moonlight to
+// the other screen reopens it there.
+const W = 800, H = 450, DURATION = 13.2;
+const SCENE = {width: W, height: H, duration: DURATION, fps: 15};
+const svg = svgRoot(W, H);
+const steps = captions(svg, [
+  [0, 3.6, 'Moonlight alone: one resolution for every screen'],
+  [3.6, 7.2, 'With moonlight-lan: the stream takes its screen’s mode'],
+  [7.2, 12.9, 'Move Moonlight to the panel: reopened there, at its mode'],
+], DURATION);
+const scene = el(svg, 'g', {transform: 'translate(0 14)'});
+text(scene, 48, 90, 'CLIENT, TWO SCREENS', {'font-size': 14, fill: C.muted, 'letter-spacing': 2, 'font-weight': 600});
+
+const mon = monitor(scene, {x: 48, y: 106, w: 320, h: 186, bezel: 7, stand: true});
+const lap = monitor(scene, {x: 500, y: 136, w: 228, h: 156});
+el(scene, 'path', {d: 'M484 292 H744 L736 306 H492 Z', fill: C.frameFill, stroke: C.frame, 'stroke-width': 2.5, 'stroke-linejoin': 'round'});
+text(scene, 208, 340, 'monitor', {'text-anchor': 'middle', fill: C.muted});
+text(scene, 208, 362, '1920x1080 @ 60 Hz', {'text-anchor': 'middle', fill: C.muted, 'font-family': MONO, 'font-size': 15});
+text(scene, 614, 340, 'laptop panel', {'text-anchor': 'middle', fill: C.muted});
+text(scene, 614, 362, '2400x1600 @ 120 Hz', {'text-anchor': 'middle', fill: C.muted, 'font-family': MONO, 'font-size': 15});
+
+// The host's desktop as streamed, in a w x h picture at (x, y).
+function stream(x, y, w, h) {
+  const g = el(scene, 'g', {opacity: 0});
+  el(g, 'rect', {x, y, width: w, height: h, fill: C.accentDim});
+  topBar(g, {x, y, w, h});
+  const ww = w * 0.42, wh = h * 0.45;
+  set(windowShape(g, ww, wh), {transform: `translate(${x + w * 0.2} ${y + h * 0.28})`});
+  return g;
+}
+const m = mon.s, l = lap.s;
+// Moonlight alone: its 2400x1600 setting on the 16:9 monitor, pillarboxed.
+const s1 = el(scene, 'g', {opacity: 0});
+el(s1, 'rect', {x: m.x, y: m.y, width: m.w, height: m.h, fill: '#000'});
+const pw = m.h * 1.5, px0 = m.x + (m.w - pw) / 2;
+s1.appendChild(set(stream(px0, m.y, pw, m.h), {opacity: 1}));
+const defs = el(svg, 'defs');
+const hatch = el(defs, 'pattern', {id: 'hatch', width: 8, height: 8, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)'});
+el(hatch, 'rect', {width: 3, height: 8, fill: C.amber, opacity: 0.55});
+for (const bx of [m.x, px0 + pw]) {
+  el(s1, 'rect', {x: bx, y: m.y, width: px0 - m.x, height: m.h, fill: 'url(#hatch)'});
+}
+const s2 = stream(m.x, m.y, m.w, m.h);   // with moonlight-lan, on the monitor
+const s3 = stream(l.x, l.y, l.w, l.h);   // after the move, on the panel
+
+// Moonlight's main window (its app list).
+const mlw = el(scene, 'g', {opacity: 0});
+el(mlw, 'rect', {width: 150, height: 104, rx: 4, fill: '#111922', stroke: C.muted, 'stroke-width': 1.5});
+el(mlw, 'rect', {width: 150, height: 15, rx: 4, fill: C.winTitle});
+el(mlw, 'rect', {y: 10, width: 150, height: 5, fill: C.winTitle});
+text(mlw, 8, 11, 'Moonlight', {'font-size': 9, fill: C.text});
+const mlGrid = moonlightGrid(mlw, {x: 1, y: 15, w: 148, h: 88});
+const clip = el(defs, 'clipPath', {id: 'screens'});
+el(clip, 'rect', {x: m.x, y: m.y, width: m.w, height: m.h});
+el(clip, 'rect', {x: l.x, y: l.y, width: l.w, height: l.h});
+const mlwClip = el(scene, 'g', {'clip-path': 'url(#screens)'});
+mlwClip.appendChild(mlw);
+const ptr = pointer(scene);
+
+// What Moonlight streams, under the screens.
+function status(s, color) {
+  const g = el(scene, 'g', {opacity: 0});
+  text(g, 400, 398, s, {'text-anchor': 'middle', fill: color, 'font-size': 17, 'font-weight': 600});
+  return g;
+}
+const st1 = status('2400x1600 stream on a 1920x1080 screen: black bars', C.amber);
+const st2 = status('Stream at 1920x1080 @ 60 Hz, the monitor’s mode', C.accent);
+const st3 = status('Stream at 2400x1600 @ 120 Hz, the panel’s mode', C.accent);
+const st4 = status('No stream running: Moonlight is reopened on the panel', C.muted);
+
+const MON_POS = [m.x + 78, m.y + 34], LAP_POS = [l.x + 33, l.y + 20];
+function render(t) {
+  steps(t);
+  // 1. Moonlight alone (and the end of the loop fading back to it).
+  set(s1, {opacity: Math.max(1 - prog(t, 3.5, 3.9), prog(t, 12.9, DURATION))});
+  set(st1, {opacity: Math.max(1 - prog(t, 3.35, 3.6), prog(t, 12.9, DURATION))});
+  // 2. Moonlight opens on the monitor (under the pointer), the stream fills it.
+  // 3. Back to the list, dragged to the panel, closed and reopened there, streams there.
+  const drag = prog(t, 7.9, 9.3);
+  const reopened = t >= 9.75;
+  const [wx, wy] = reopened ? LAP_POS : [lerp(MON_POS[0], LAP_POS[0], drag), lerp(MON_POS[1], LAP_POS[1], drag)];
+  const shown = Math.min(fade(t, 4.0, 4.35, 5.05, 5.35) + fade(t, 7.35, 7.65, 9.45, 9.75),
+    1) + fade(t, 10.05, 10.4, 11.2, 11.5);
+  set(mlw, {transform: `translate(${wx} ${wy})`, opacity: shown});
+  set(s2, {opacity: fade(t, 5.0, 5.4, 7.2, 7.55)});
+  set(s3, {opacity: fade(t, 11.2, 11.6, 12.9, DURATION)});
+  set(st2, {opacity: fade(t, 5.2, 5.5, 7.0, 7.25)});
+  set(st4, {opacity: fade(t, 9.3, 9.55, 10.6, 10.85)});
+  set(st3, {opacity: fade(t, 11.4, 11.7, 12.65, 12.9)});
+  // Clicks on the Extend tile.
+  const tile = mlGrid.tiles[0];
+  set(tile.ring, {opacity: fade(t, 4.75, 4.85, 5.2, 5.3) + fade(t, 10.9, 11.0, 11.35, 11.45)});
+  // The pointer: opens Moonlight, clicks, drags the title bar, clicks again.
+  const tileAt = (x, y) => [x + tile.cx - 2, y + tile.cy];
+  let p, po = 0;
+  if (t < 3.7) {
+    p = [m.x + 230, m.y + 140];
+  } else if (t < 5.3) {
+    const a = [m.x + 230, m.y + 140], b = tileAt(...MON_POS);
+    const k = prog(t, 4.2, 4.75);
+    p = [lerp(a[0], b[0], k), lerp(a[1], b[1], k)];
+    po = fade(t, 3.7, 3.95, 5.05, 5.3);
+  } else if (t < 9.6) {
+    const grab = [wx + 40, wy + 7];
+    p = t < 7.9 ? [lerp(m.x + 200, grab[0], prog(t, 7.4, 7.85)), lerp(m.y + 130, grab[1], prog(t, 7.4, 7.85))] : grab;
+    po = fade(t, 7.3, 7.5, 9.35, 9.6);
+  } else {
+    const a = [l.x + 160, l.y + 118], b = tileAt(...LAP_POS);
+    const k = prog(t, 10.4, 10.9);
+    p = [lerp(a[0], b[0], k), lerp(a[1], b[1], k)];
+    po = fade(t, 10.0, 10.25, 11.25, 11.5);
+  }
+  set(ptr, {transform: `translate(${p[0]} ${p[1]})`, opacity: po});
+}
+render(0);
+</script>

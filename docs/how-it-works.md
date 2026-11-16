@@ -1,5 +1,7 @@
 # How it works
 
+![Moonlight sends its mode to Sunshine, which runs gnome-virtual-display; the tool lays out the desktop through Mutter and injects an EDID through a root helper into a free GPU connector; Sunshine captures that connector through KMS and streams it back](images/architecture.svg)
+
 ## A monitor that is not there
 
 A GPU output with nothing plugged in can be made to look connected through the kernel's DRM debugfs:
@@ -61,6 +63,8 @@ Rules the tool keeps:
   not exist at boot: a file that names it never matches, and Mutter starts with its defaults.
 
 ## The life of a stream
+
+![States of a stream: at rest, prep moves to streaming at the client's mode; Quit goes back to rest at once; a dropped stream frees the app 6 s later and keeps the layout for grace; a reconnection is a new launch with prep at its mode; without one, back to rest](images/lifecycle.svg)
 
 1. At login the user service runs `boot`: the connector is plugged (switched off in the layout) and
    the remembered layout applied. Plugging at rest avoids a hotplug in the middle of a stream start.

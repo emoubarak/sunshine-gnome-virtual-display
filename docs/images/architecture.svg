@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="460" viewBox="0 0 880 460" role="img" aria-label="How the parts talk: Moonlight, Sunshine, gnome-virtual-display, Mutter, the root helper and the GPU connector">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #ecf1f5; }
+    .head { font-size: 12px; font-weight: 700; fill: #8c9ba8; letter-spacing: 1.5px; }
+    .title { font-size: 16px; font-weight: 600; }
+    .sub { font-size: 13px; fill: #8c9ba8; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 12.5px; }
+    .lab { font-size: 13px; fill: #8c9ba8; }
+    .laba { font-size: 13px; fill: #4dd1c5; }
+    .box { fill: #141d26; stroke: #3a4a58; stroke-width: 1.5; }
+    .ours { fill: #13302f; stroke: #4dd1c5; stroke-width: 1.5; }
+    .host { fill: #111a22; stroke: #223040; stroke-width: 1.5; }
+    .arrow { fill: none; stroke: #8c9ba8; stroke-width: 2; marker-end: url(#grey); }
+    .arrowa { fill: none; stroke: #4dd1c5; stroke-width: 2; marker-end: url(#teal); }
+  </style>
+  <defs>
+    <marker id="grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#8c9ba8"/></marker>
+    <marker id="teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#4dd1c5"/></marker>
+  </defs>
+  <rect width="880" height="460" rx="12" fill="#0e151c"/>
+
+  <text class="head" x="28" y="40">CLIENT</text>
+  <rect class="host" x="268" y="22" width="594" height="420" rx="10"/>
+  <text class="head" x="288" y="48">HOST, GNOME ON WAYLAND</text>
+
+  <!-- Row 1 -->
+  <rect class="box" x="28" y="76" width="170" height="70" rx="8"/>
+  <text class="title" x="46" y="106">Moonlight</text>
+  <text class="sub" x="46" y="128">the client</text>
+
+  <rect class="box" x="300" y="76" width="200" height="70" rx="8"/>
+  <text class="title" x="318" y="106">Sunshine</text>
+  <text class="sub" x="318" y="128">streams the connector</text>
+
+  <rect class="ours" x="590" y="76" width="256" height="70" rx="8"/>
+  <text class="title" x="608" y="106">gnome-virtual-display</text>
+  <text class="sub mono" x="608" y="128">prep · wait · hold · undo</text>
+
+  <path class="arrow" d="M198 100 H296"/>
+  <text class="lab mono" x="249" y="91" text-anchor="middle">WxH@Hz</text>
+  <path class="arrowa" d="M300 124 H202"/>
+  <text class="laba" x="249" y="142" text-anchor="middle">video</text>
+  <path class="arrow" d="M500 111 H586"/>
+  <text class="lab" x="545" y="102" text-anchor="middle">runs</text>
+
+  <!-- Row 2 -->
+  <rect class="box" x="452" y="214" width="190" height="80" rx="8"/>
+  <text class="title" x="470" y="242">Mutter</text>
+  <text class="sub mono" x="470" y="262">ApplyMonitorsConfig</text>
+  <text class="sub" x="470" y="281">temporary: no prompt</text>
+
+  <rect class="ours" x="656" y="214" width="190" height="80" rx="8"/>
+  <text class="title" x="674" y="242">Root helper</text>
+  <text class="sub" x="674" y="262">one sudo rule,</text>
+  <text class="sub" x="674" y="281">one connector</text>
+
+  <path class="arrow" d="M616 146 V210"/>
+  <text class="lab" x="608" y="184" text-anchor="end">layout</text>
+  <path class="arrow" d="M752 146 V210"/>
+  <text class="lab" x="760" y="184">EDID</text>
+
+  <!-- Row 3 -->
+  <rect class="box" x="452" y="350" width="394" height="74" rx="8"/>
+  <text class="title" x="470" y="378">Free GPU connector, e.g. DP-2</text>
+  <text class="sub mono" x="470" y="402">debugfs: edid_override, force, trigger_hotplug</text>
+
+  <path class="arrow" d="M752 294 V346"/>
+  <text class="lab" x="760" y="326">writes</text>
+  <path class="arrow" d="M547 350 V298"/>
+  <text class="lab" x="539" y="326" text-anchor="end">a monitor appears</text>
+
+  <!-- Capture -->
+  <path class="arrowa" d="M452 404 H400 V150"/>
+  <text class="laba" x="390" y="270" text-anchor="end">KMS capture</text>
+  <text class="lab mono" x="390" y="290" text-anchor="end">output_name</text>
+
+  <rect class="ours" x="28" y="404" width="14" height="14" rx="3"/>
+  <text class="lab" x="50" y="416">this project</text>
+</svg>

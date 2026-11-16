@@ -3,6 +3,8 @@
 Two things make a stream between two machines of the same Wi-Fi network slow, and neither is the
 bitrate.
 
+![The stream crosses the Wi-Fi twice, host to access point and access point to client, and the host's downloads share the first hop. Through the VPN address: 1024-byte packets, no DSCP marks, 42 ms. Through the LAN address with stream-qos: 1392-byte packets marked DSCP 40 and 48, internet TCP shaped to 40 Mbit/s, 5 to 9 ms](images/network.svg)
+
 ## Measurements
 
 One host (Wi-Fi 6, 160 MHz, 5 GHz), one laptop client on the same access point, Moonlight 6.2,

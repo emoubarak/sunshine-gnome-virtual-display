@@ -4,6 +4,8 @@ Stream a GNOME Wayland desktop to Moonlight on a **virtual monitor** that matche
 no dummy plug. Use the laptop or tablet as an extra screen next to your monitors, or as the only
 screen of the host, then get your desk back exactly as it was when the stream ends.
 
+![Moonlight opens Extend on a laptop: a virtual monitor at the laptop's 2400x1600 @ 120 Hz appears to the right of the host's monitor and takes the top bar, a window is dragged onto it and shows on the laptop, and Quit puts the desk back](docs/images/extend.gif)
+
 - **Plug and play.** `./install.sh` finds a free output on your GPU, writes the sudo rules, the
   services and the Sunshine settings, and adds three entries to Moonlight. Nothing to edit by hand.
 - **The client's resolution, every time.** Before each stream the virtual monitor takes the
@@ -23,6 +25,8 @@ screen of the host, then get your desk back exactly as it was when the stream en
   [network](docs/network.md).
 
 ## Moonlight entries
+
+![The three entries: Extend adds the virtual monitor to the right of your monitors, Virtual only and Remote keep it alone with your monitors off, Remote at 60 Hz](docs/images/modes.svg)
 
 | Entry | What you get |
 |---|---|
@@ -117,6 +121,8 @@ ports that only exist when a dock or a USB-C device is attached. Use the kernel'
   (`moonlight-lan stream HOST APP`) get `--resolution` and `--fps` too, unless they give them.
   `MATCH_SCREEN=0` in `~/.config/gnome-virtual-display/moonlight-lan.conf` turns it off; without
   the extension Moonlight keeps its own settings.
+
+  ![A client with a 1920x1080 monitor and a 2400x1600 panel: Moonlight alone streams 2400x1600 on the monitor with black bars; with moonlight-lan the stream fills the monitor at 1920x1080 @ 60 Hz, and moving Moonlight to the panel reopens it there at 2400x1600 @ 120 Hz](docs/images/client-screens.gif)
 
   ```bash
   ln -s "$PWD/client/moonlight-lan" ~/.local/bin/moonlight-lan

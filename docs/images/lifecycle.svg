@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="430" viewBox="0 0 880 430" role="img" aria-label="The life of a stream: at rest, streaming, kept for a reconnection">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #ecf1f5; }
+    .title { font-size: 17px; font-weight: 600; }
+    .sub { font-size: 13.5px; fill: #8c9ba8; }
+    .lab { font-size: 13.5px; fill: #8c9ba8; }
+    .laba { font-size: 13.5px; fill: #4dd1c5; }
+    .labm { font-size: 13.5px; fill: #f0b35b; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; }
+    .box { fill: #141d26; stroke: #3a4a58; stroke-width: 1.5; }
+    .live { fill: #13302f; stroke: #4dd1c5; stroke-width: 1.5; }
+    .kept { fill: #141d26; stroke: #4dd1c5; stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .a { fill: none; stroke-width: 2; }
+  </style>
+  <defs>
+    <marker id="grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#8c9ba8"/></marker>
+    <marker id="teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#4dd1c5"/></marker>
+    <marker id="amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#f0b35b"/></marker>
+  </defs>
+  <rect width="880" height="430" rx="12" fill="#0e151c"/>
+
+  <!-- States -->
+  <rect class="box" x="28" y="146" width="210" height="88" rx="10"/>
+  <text class="title" x="48" y="178">At rest</text>
+  <text class="sub" x="48" y="200">virtual monitor off,</text>
+  <text class="sub" x="48" y="219">your layout</text>
+
+  <rect class="live" x="336" y="146" width="212" height="88" rx="10"/>
+  <text class="title" x="356" y="178">Streaming</text>
+  <text class="sub" x="356" y="200">virtual monitor at</text>
+  <text class="sub" x="356" y="219">the client's mode</text>
+
+  <rect class="kept" x="632" y="146" width="228" height="88" rx="10"/>
+  <text class="title" x="652" y="178">Kept for a reconnection</text>
+  <text class="sub" x="652" y="200">same layout, no app,</text>
+  <text class="sub" x="652" y="219">for <tspan class="mono">grace</tspan> (90 s)</text>
+
+  <!-- At rest to streaming -->
+  <path class="a" stroke="#4dd1c5" marker-end="url(#teal)" d="M196 146 C 226 92, 336 92, 370 142"/>
+  <text class="laba" x="283" y="70" text-anchor="middle"><tspan class="mono">prep MODE</tspan> at the</text>
+  <text class="laba" x="283" y="88" text-anchor="middle">client's WxH@Hz</text>
+
+  <!-- Streaming to at rest: Quit -->
+  <path class="a" stroke="#8c9ba8" marker-end="url(#grey)" d="M370 234 C 336 286, 226 286, 200 238"/>
+  <text class="lab" x="285" y="302" text-anchor="middle">Quit: <tspan class="mono">undo</tspan>,</text>
+  <text class="lab" x="285" y="320" text-anchor="middle">base at once</text>
+
+  <!-- Streaming to kept: dropped -->
+  <path class="a" stroke="#f0b35b" marker-end="url(#amber)" d="M512 146 C 544 92, 634 92, 668 142"/>
+  <text class="labm" x="590" y="70" text-anchor="middle">stream dropped, 6 s later:</text>
+  <text class="labm" x="590" y="88" text-anchor="middle">Sunshine frees the app</text>
+
+  <!-- Kept to streaming: reconnection -->
+  <path class="a" stroke="#4dd1c5" marker-end="url(#teal)" d="M668 234 C 634 286, 546 286, 516 238"/>
+  <text class="laba" x="592" y="302" text-anchor="middle">reconnection: a new launch,</text>
+  <text class="laba" x="592" y="320" text-anchor="middle"><tspan class="mono">prep</tspan> at its mode</text>
+
+  <!-- Kept to at rest: grace over -->
+  <path class="a" stroke="#8c9ba8" marker-end="url(#grey)" d="M800 234 C 800 400, 133 400, 133 238"/>
+  <text class="lab" x="466" y="404" text-anchor="middle">no reconnection within <tspan class="mono">grace</tspan>: base</text>
+</svg>

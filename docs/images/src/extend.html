@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Extend</title>
+<style>html, body { margin: 0; background: #0e151c; } svg { display: block; }</style>
+<body>
+<script src="common.js"></script>
+<script>
+// README hero: Moonlight opens Extend, a virtual monitor appears next to the host's monitor at the
+// client's mode, a window is dragged onto it, Quit gives the desk back.
+const W = 800, H = 450, DURATION = 10.4;
+const SCENE = {width: W, height: H, duration: DURATION, fps: 15};
+const svg = svgRoot(W, H);
+const steps = captions(svg, [
+  [0, 1.65, 'Moonlight on the laptop: open Extend'],
+  [1.65, 3.65, 'A virtual monitor appears, at the laptop’s mode'],
+  [3.65, 6.85, 'Drag a window across: the laptop is a second screen'],
+  [6.85, 10.1, 'Quit: the virtual monitor goes off, the desk is back'],
+], DURATION);
+// Content a little lower: the caption is on top, the progress bar at the bottom.
+const scene = el(svg, 'g', {transform: 'translate(0 14)'});
+
+text(scene, 48, 104, 'HOST', {'font-size': 14, fill: C.muted, 'letter-spacing': 2, 'font-weight': 600});
+text(scene, 572, 104, 'CLIENT', {'font-size': 14, fill: C.muted, 'letter-spacing': 2, 'font-weight': 600});
+
+// Host: the physical monitor and, during the stream, the virtual one against its right edge,
+// vertically centred.
+const phys = monitor(scene, {x: 48, y: 128, w: 264, h: 152, stand: true});
+const virtG = el(scene, 'g');
+const virt = monitor(virtG, {x: 312, y: 142, w: 186, h: 124, bezel: 5, virtual: true});
+const physBar = topBar(scene, phys.s);
+const virtBar = topBar(virtG, virt.s);
+
+text(scene, 180, 324, 'your monitor', {'text-anchor': 'middle', fill: C.muted});
+const virtLabel = el(scene, 'g');
+text(virtLabel, 405, 302, 'virtual monitor', {'text-anchor': 'middle', fill: C.accent});
+text(virtLabel, 405, 324, '2400x1600 @ 120 Hz', {'text-anchor': 'middle', fill: C.accent, 'font-family': MONO, 'font-size': 15});
+
+// Window, shown only where a screen is.
+const clip = el(el(scene, 'defs'), 'clipPath', {id: 'screens'});
+el(clip, 'rect', {x: phys.s.x, y: phys.s.y, width: phys.s.w, height: phys.s.h});
+const clipVirt = el(clip, 'rect', {x: virt.s.x, y: virt.s.y, width: virt.s.w, height: virt.s.h});
+const win = windowShape(el(scene, 'g', {'clip-path': 'url(#screens)'}), 118, 76);
+const hostPtr = pointer(scene);
+
+// Client: a laptop running Moonlight.
+const lap = monitor(scene, {x: 572, y: 140, w: 204, h: 136});
+el(scene, 'path', {d: 'M556 276 H792 L784 290 H564 Z', fill: C.frameFill, stroke: C.frame, 'stroke-width': 2.5, 'stroke-linejoin': 'round'});
+text(scene, 674, 318, 'laptop with Moonlight', {'text-anchor': 'middle', fill: C.muted});
+text(scene, 674, 340, '2400x1600 @ 120 Hz', {'text-anchor': 'middle', fill: C.muted, 'font-family': MONO, 'font-size': 15});
+
+// What the laptop shows during the stream: the virtual monitor's content.
+const sx = lap.s.w / virt.s.w, sy = lap.s.h / virt.s.h;
+const mirror = el(scene, 'g', {transform: `translate(${lap.s.x} ${lap.s.y}) scale(${sx} ${sy}) translate(${-virt.s.x} ${-virt.s.y})`});
+el(el(scene, 'defs'), 'clipPath', {id: 'virt'}).appendChild(
+  set(document.createElementNS(NS, 'rect'), {x: virt.s.x, y: virt.s.y, width: virt.s.w, height: virt.s.h}));
+const mirrorIn = el(mirror, 'g', {'clip-path': 'url(#virt)'});
+el(mirrorIn, 'rect', {x: virt.s.x, y: virt.s.y, width: virt.s.w, height: virt.s.h, fill: C.accentDim});
+topBar(mirrorIn, virt.s);
+const winCopy = windowShape(mirrorIn, 118, 76);
+const ptrCopy = pointer(mirrorIn);
+const grid = moonlightGrid(scene, lap.s);
+const lapPtr = pointer(scene);
+
+const link = el(scene, 'line', {x1: 502, y1: 204, x2: 566, y2: 204, stroke: C.accent, 'stroke-width': 3, 'stroke-dasharray': '6 6'});
+const linkHead = el(scene, 'path', {d: 'M566 197 L575 204 L566 211 Z', fill: C.accent});
+
+function render(t) {
+  steps(t);
+  // Moonlight: pointer to Extend, click.
+  const go = prog(t, 0.3, 1.1);
+  set(lapPtr, {transform: `translate(${lerp(712, grid.tiles[0].cx, go)} ${lerp(252, grid.tiles[0].cy, go)})`,
+    opacity: fade(t, 0, 0.3, 2.55, 2.75)});
+  const ring = grid.tiles[0].ring;
+  set(ring, {opacity: fade(t, 1.1, 1.3, 3.0, 3.2)});
+  const press = 1 - 0.08 * Math.sin(Math.PI * clamp((t - 1.1) / 0.3));
+  set(grid.tiles[0].tile, {transform: `translate(${grid.tiles[0].cx} ${grid.tiles[0].cy}) scale(${press}) translate(${-grid.tiles[0].cx} ${-grid.tiles[0].cy})`});
+
+  // The virtual monitor comes (prep) and goes (undo).
+  const v = fade(t, 1.75, 2.4, 7.3, 7.9);
+  const k = lerp(0.9, 1, v);
+  set(virtG, {opacity: v, transform: `translate(405 204) scale(${k}) translate(-405 -204)`});
+  set(virtLabel, {opacity: v});
+  set(clipVirt, {width: v > 0.98 ? virt.s.w : 0});
+  // Primary role: the top bar moves to the virtual monitor and back.
+  const primary = fade(t, 2.3, 2.7, 7.4, 7.8);
+  set(physBar, {opacity: 1 - primary});
+  set(virtBar, {opacity: primary});
+
+  // The laptop: Moonlight's list, then the stream, then the list again.
+  const stream = fade(t, 2.75, 3.2, 6.9, 7.3);
+  set(grid.g, {opacity: 1 - stream});
+  set(mirror, {opacity: stream});
+  set(link, {opacity: stream, 'stroke-dashoffset': -t * 36});
+  set(linkHead, {opacity: stream});
+
+  // The window: dragged onto the virtual monitor, put back on the physical one when it goes.
+  const drag = prog(t, 3.9, 5.7);
+  let wx = lerp(96, 350, drag), wy = lerp(176, 182, drag), wo = 1;
+  if (t >= 7.4) {
+    const out = prog(t, 7.4, 7.65), back = prog(t, 7.65, 7.9);
+    if (t < 7.65) { wo = 1 - out; } else { wx = 96; wy = 176; wo = back; }
+  }
+  set(win, {transform: `translate(${wx} ${wy})`, opacity: wo});
+  set(winCopy, {transform: `translate(${wx} ${wy})`, opacity: wo});
+  // The host's pointer grabs the title bar, then wanders on the virtual monitor.
+  const wander = prog(t, 5.8, 6.6);
+  const px = wx + 34 + lerp(0, 52, wander), py = wy + 7 + lerp(0, 40, wander);
+  const ptrO = fade(t, 3.4, 3.7, 6.6, 6.85);
+  set(hostPtr, {transform: `translate(${px} ${py})`, opacity: ptrO});
+  set(ptrCopy, {transform: `translate(${px} ${py})`, opacity: ptrO});
+}
+render(0);
+</script>
