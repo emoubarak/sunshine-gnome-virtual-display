@@ -16,11 +16,28 @@ Start with `gnome-virtual-display list` (outputs, modes, layout) and the logs:
 ## The stream shows a physical monitor instead of the virtual one
 
 Sunshine skipped the `prep` command because it still believed the previous app was running (the
-client vanished without quitting). Entries in the current format free the app as soon as the stream
-drops (`gnome-virtual-display sync-apps` updates older ones, then restart Sunshine). The watcher
-also restarts Sunshine between sessions when it sees this;
-to do it at once: `systemctl --user restart <sunshine unit>`. Enable "Quit app on host PC after ending
-stream" in Moonlight to make clean ends the norm.
+client vanished without quitting). Entries in the current format free the app 6 s after the stream
+drops; older ones are updated by themselves (at the next Sunshine start, or by the watcher between
+streams), unless `manage_sunshine_apps = false`. The watcher also restarts Sunshine between
+sessions when it sees this; to do it at once: `systemctl --user restart <sunshine unit>`. Enable
+"Quit app on host PC after ending stream" in Moonlight to make clean ends the norm.
+
+## Extend is missing in Moonlight
+
+Extend is only listed when a physical monitor is plugged into the host. Check that the host sees
+one: `for c in /sys/class/drm/card*-*; do echo "$(basename $c) $(cat $c/status)"; done` (the virtual
+connector does not count). Once a monitor is plugged, the watcher puts Extend back and restarts
+Sunshine between streams; refresh the host's app list in Moonlight. The entry set aside meanwhile
+is in `~/.local/state/gnome-virtual-display/hidden-apps.json`. With `manage_sunshine_apps = false`
+the entries are never changed.
+
+## After a reconnection the stream keeps the previous resolution (black bars)
+
+The entry is in an older format (no `gnome-virtual-display hold` command in `apps.json`), so the
+reconnection resumed the app and Sunshine ran no `prep`. The watcher updates it between streams
+(`gnome-virtual-display sync-apps` does it at once, the watcher then restarts Sunshine). With
+`manage_sunshine_apps = false`, copy the `cmd`, `detached` and `undo` lines of
+[apps.example.json](../sunshine/apps.example.json) into your entries.
 
 ## The pointer cannot leave the streamed screen
 

@@ -27,6 +27,7 @@ grace = 90
 # Sunshine user unit and log (the log tells which screen a session captured and when it ended).
 sunshine_unit = "app-dev.lizardbyte.app.Sunshine.service"
 sunshine_log = "~/.config/sunshine/sunshine.log"
+sunshine_apps = "~/.config/sunshine/apps.json"
 
 # Keep our Moonlight entries in Sunshine's apps.json current: their format after an update, and
 # Extend listed only when a physical monitor is plugged in. install.sh --no-sunshine-config: false.

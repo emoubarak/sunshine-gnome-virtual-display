@@ -3,7 +3,7 @@
 # Moonlight session is active, off otherwise. Runs as a user service (systemd/stream-qos-watch.service).
 #
 # Session ends that Sunshine really logs: "CLIENT DISCONNECTED", "<ip>: Ping Timeout" (Wi-Fi lost,
-# client asleep: no DISCONNECTED line and no undo command), "Executing Undo Cmd" alone (Quit from
+# client asleep: no DISCONNECTED line, the undo command only 6 s later), "Executing Undo Cmd" alone (Quit from
 # Moonlight). Sessions are counted because two can overlap ("active sessions: 2" when a client
 # reconnects before its old session timed out).
 # Every 60 s without a line the real state is checked again: shaping missing after a switch from

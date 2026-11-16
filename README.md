@@ -65,8 +65,9 @@ cd sunshine-gnome-virtual-display
 ```
 
 Then pair Moonlight with the host and open **Extend**. `gnome-virtual-display list` shows the outputs
-and the current layout. To update: `git pull` (the commands are linked from the clone; run
-`./install.sh` again when the root helper or the units changed).
+and the current layout. To update: `git pull` (the commands are linked from the clone and the
+Moonlight entries follow by themselves; run `./install.sh` again when the root helper or the units
+changed).
 
 What the installer changes, so nothing surprises you:
 
@@ -111,7 +112,8 @@ ports that only exist when a dock or a USB-C device is attached. Use the kernel'
   GNOME Shell extension next to it: each stream then takes the resolution and refresh rate of the
   screen Moonlight opens on, and moving the Moonlight window to another screen before a stream
   reopens Moonlight there, with that screen's mode (never during a stream, and only for a Moonlight
-  started by `moonlight-lan`). Desktop entries that start a stream directly
+  started by `moonlight-lan`). Unplugging the screen Moonlight is on reopens it on a remaining one;
+  plugging or unplugging another screen leaves it alone. Desktop entries that start a stream directly
   (`moonlight-lan stream HOST APP`) get `--resolution` and `--fps` too, unless they give them.
   `MATCH_SCREEN=0` in `~/.config/gnome-virtual-display/moonlight-lan.conf` turns it off; without
   the extension Moonlight keeps its own settings.
@@ -134,6 +136,7 @@ are documented in [config.example.toml](config.example.toml). The most useful on
 | `match_client` | `true` | follow each client's resolution; `false` keeps one fixed EDID |
 | `fallback_scale` | `1.25` | scale of the virtual monitor until you choose one |
 | `grace` | `90` | seconds a dropped stream keeps the virtual layout for a quick reconnection |
+| `manage_sunshine_apps` | `true` | keep our Moonlight entries current (format after an update, Extend only with a monitor); `false` leaves `apps.json` alone |
 
 Your physical monitors: change them in GNOME Settings. Outside streams the tool learns what you set
 (position, scale, rotation, primary, monitors switched off) and gives it back after each stream. The
@@ -154,8 +157,8 @@ off | fix-session | sync-apps`. The Sunshine entries use `prep MODE`, `wait MODE
 
 ## Uninstall
 
-`./install.sh --uninstall` removes the services, the root helper, the sudo rules and the links, the
-three Moonlight entries and `output_name` from Sunshine's config, and turns off the boot start if the
+`./install.sh --uninstall` removes the services, the root helper, the sudo rules and the links, our
+Moonlight entries and `output_name` from Sunshine's config, and turns off the boot start if the
 installer turned it on. Your config, the remembered layout and the EDID are kept, and Sunshine's
 files are backed up first in `~/.local/state/gnome-virtual-display/backup/`.
 
@@ -163,7 +166,9 @@ files are backed up first in `~/.local/state/gnome-virtual-display/backup/`.
 
 Fedora 44, kernel 7.3, GNOME 50 (Mutter 50), Sunshine 2026.914, AMD Radeon 780M with one physical
 monitor plus the virtual one, Moonlight 6.2 on a Linux laptop: Extend, Virtual only, Remote, and
-client matching from 2400x1600 at 120 Hz to 1920x1080 at 60 Hz and back. Layouts with several
+client matching from 2400x1600 at 120 Hz to 1920x1080 at 60 Hz and back, a dropped stream then a
+reconnection at another resolution, a clean quit, and the grace period running out. The stream
+lifecycle (sessions, grace, `apps.json`) is covered by `python3 tests/test_session.py`. Layouts with several
 physical monitors, HDMI naming and unplugged monitors are covered by the test suite
 (`python3 tests/test_layout.py`), and the layout fitting is checked against a real Mutter running
 headless with three virtual monitors (`tests/check_with_headless_mutter.py`, command in its header),

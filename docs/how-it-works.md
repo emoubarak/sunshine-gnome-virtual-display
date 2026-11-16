@@ -80,9 +80,10 @@ Rules the tool keeps:
    `prep` runs with that client's resolution on the layout still in place. Sunshine runs no command
    on a resume, so a resumed app would keep the previous client's resolution (a laptop that moved
    its Moonlight window from a 16:9 monitor to its 3:2 panel would get black bars). Without a
-   reconnection, `wait` restores base. Entries written by an older install (no `hold`) keep the
-   old behaviour, base and a Sunshine restart after the grace period, until `./install.sh` or
-   `gnome-virtual-display sync-apps` updates them.
+   reconnection, `wait` restores base. Entries written by an older install (no `hold`) are
+   updated by themselves, at the next Sunshine start or by the watcher between streams. With
+   `manage_sunshine_apps = false` they keep the old behaviour: base and a Sunshine restart after
+   the grace period.
 5. A newer stream wins: `prep` and `wait` share a session token, and an old `wait` whose token was
    replaced leaves without touching the layout.
 
@@ -107,9 +108,13 @@ of the way while an app is engaged (between `prep` and the client's connection t
 session yet; acting then would switch the virtual monitor off right before the capture starts):
 
 - outside streams: learns the layout you set in GNOME Settings, and switches off a virtual monitor
-  left on (the physical monitors then get their remembered layout back);
+  left on when a physical monitor is plugged in (the physical monitors then get their remembered
+  layout back); without one the virtual monitor is the only screen and stays on;
+- our Moonlight entries out of date (a physical monitor plugged or unplugged, entries of an older
+  install, a manual `sync-apps`): `apps.json` is updated and Sunshine restarted between streams;
 - Sunshine stuck on an app after a dropped stream, or a session that captured a physical monitor:
-  Sunshine is restarted between sessions, at most once every 120 s;
+  Sunshine is restarted between sessions;
+- Sunshine restarts are spaced at least 120 s apart;
 - Xwayland frozen (see below): GDM is restarted.
 
 Each call to Mutter is bounded to 5 s. A frozen gnome-shell gives exit code 3 and a line in
