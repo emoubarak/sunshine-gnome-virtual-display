@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""moonlight-screen: the mode of the screen Moonlight is about to open on (GNOME client).
+
+Prints "WIDTH HEIGHT FPS X Y": the screen's current mode in real pixels (rotation included) and
+its refresh rate rounded, then the screen's position in the GNOME layout. The screen is:
+  - the one at MOONLIGHT_SCREEN="X,Y" (set when the extension reopens Moonlight on another screen);
+  - else the one under the pointer, where Mutter opens a new window, as told by the
+    moonlight-screen@sunshine-gnome-virtual-display GNOME Shell extension;
+  - else the only screen switched on.
+Exits with 1 when it cannot tell (extension missing and several screens on).
+"""
+import os
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+
+def call(bus, dest, path, method):
+    interface = dest if dest != "org.gnome.Shell" else "org.gnome.Shell.Extensions.MoonlightScreen"
+    reply = bus.call_sync(dest, path, interface, method, None, None,
+                          Gio.DBusCallFlags.NONE, 2000, None)
+    return reply.unpack()
+
+
+def target_origin(bus, logical):
+    value = os.environ.get("MOONLIGHT_SCREEN", "")
+    if value:
+        try:
+            x, y = (int(v) for v in value.split(","))
+            return x, y
+        except ValueError:
+            pass
+    try:
+        x, y, _w, _h = call(bus, "org.gnome.Shell", "/org/gnome/Shell/Extensions/MoonlightScreen",
+                            "PointerMonitor")
+        return x, y
+    except GLib.Error:
+        if len(logical) == 1:
+            return logical[0][0], logical[0][1]
+    return None
+
+
+def main():
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    _serial, monitors, logical, _props = call(bus, "org.gnome.Mutter.DisplayConfig",
+                                              "/org/gnome/Mutter/DisplayConfig", "GetCurrentState")
+    origin = target_origin(bus, logical)
+    if origin is None:
+        return 1
+    for x, y, _scale, transform, _primary, outputs, _props in logical:
+        if (x, y) != origin:
+            continue
+        connector = outputs[0][0]
+        for spec, modes, _mprops in monitors:
+            if spec[0] != connector:
+                continue
+            for mode in modes:
+                if mode[6].get("is-current"):
+                    width, height, refresh = mode[1], mode[2], mode[3]
+                    if transform % 2:  # 90 or 270 degrees
+                        width, height = height, width
+                    print(width, height, round(refresh), x, y)
+                    return 0
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except GLib.Error:
+        sys.exit(1)

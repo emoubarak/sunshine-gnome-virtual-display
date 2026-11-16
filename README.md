@@ -97,6 +97,21 @@ ports that only exist when a dock or a USB-C device is attached. Use the kernel'
   to its normal layout right away instead of after the grace period.
 - On a Linux client that also reaches the host through a VPN, start Moonlight with
   [`client/moonlight-lan`](client/moonlight-lan) (see [network](docs/network.md)).
+- **Client with several screens** (GNOME client): Moonlight keeps one resolution for every stream
+  and shows it on the screen its window is on, so a 2400x1600 setting streamed on a 1920x1080
+  monitor gets black bars on the sides. Start Moonlight with `client/moonlight-lan` and add the
+  GNOME Shell extension next to it: each stream then takes the resolution and refresh rate of the
+  screen Moonlight opens on, and moving the Moonlight window to another screen before a stream
+  reopens Moonlight there, with that screen's mode. Desktop entries that start a stream directly
+  (`moonlight-lan stream HOST APP`) get `--resolution` and `--fps` too, unless they give them.
+  `MATCH_SCREEN=0` in `~/.config/gnome-virtual-display/moonlight-lan.conf` turns it off.
+
+  ```bash
+  ln -s "$PWD/client/moonlight-lan" ~/.local/bin/moonlight-lan
+  ln -s "$PWD/client/moonlight-screen@sunshine-gnome-virtual-display" ~/.local/share/gnome-shell/extensions/
+  # GNOME loads a new extension at login: log out and back in, then
+  gnome-extensions enable moonlight-screen@sunshine-gnome-virtual-display
+  ```
 
 ## Configuration
 
@@ -144,7 +159,10 @@ physical monitors, HDMI naming and unplugged monitors are covered by the test su
 headless with three virtual monitors (`tests/check_with_headless_mutter.py`, command in its header),
 not yet on real multi-monitor hardware. Also run on an Intel HD Graphics 630 laptop (i915, Kaby Lake,
 GTX 1060 next to it): the virtual monitor on a free HDMI port at 2400x1600 and 60 Hz, Extend next to
-the laptop panel. Reports from other GPUs, distributions and setups are welcome.
+the laptop panel. The client side for several screens (`moonlight-lan` and its GNOME Shell
+extension) is checked against a real GNOME Shell 50 running headless with a 2400x1600 and a
+1920x1080 screen (`tests/check_moonlight_screen.sh`). Reports from other GPUs, distributions and
+setups are welcome.
 
 ## Limits
 

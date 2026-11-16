@@ -20,17 +20,28 @@
 # Reserve each address in the router's DHCP. A host that is sometimes on Ethernet: list its
 # Ethernet address first, then its Wi-Fi one. All are probed at once (2 s at most) and the first
 # one in the list that answers wins.
+#
+# It also gives the stream the resolution and refresh rate of the screen Moonlight opens on (a
+# 2400x1600 panel at 120 Hz, a 1920x1080 monitor at 60 Hz next to it), with the GNOME Shell
+# extension client/moonlight-screen@sunshine-gnome-virtual-display: written in Moonlight's settings
+# for a plain start, added as --resolution and --fps to "stream" (unless given). When the Moonlight
+# window is moved to another screen before a stream, the extension reopens Moonlight there.
+#   MATCH_SCREEN=0       # in the config file: keep Moonlight's own resolution and refresh rate
 # Use it as the Exec= of the Moonlight desktop entry (see docs/network.md).
 set -u
 CONF=${MOONLIGHT_LAN_CONF:-$HOME/.config/gnome-virtual-display/moonlight-lan.conf}
 ML_CONF="$HOME/.var/app/com.moonlight_stream.Moonlight/config/Moonlight Game Streaming Project/Moonlight.conf"
-HOST="" LAN_ADDRESS=""
+SELF=$(readlink -f "$0")
+STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/moonlight-lan.screen"
+HOST="" LAN_ADDRESS="" MATCH_SCREEN=1
+ARGS=("$@")
 # "HOST<TAB>addresses" per host, in the order of the file
 PAIRS=""
 if [ -r "$CONF" ]; then
   PAIRS=$(sed -n -e 's/^[[:space:]]*HOST[[:space:]]*=[[:space:]]*"\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}[[:space:]]*$/H \1/p' \
                  -e 's/^[[:space:]]*LAN_ADDRESS[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9. ]*\)"\{0,1\}[[:space:]]*$/A \1/p' "$CONF" |
     awk '$1 == "H" { h = $2; next } $1 == "A" && h != "" { sub(/^A /, ""); print h "\t" $0; h = "" }')
+  grep -qE '^[[:space:]]*MATCH_SCREEN[[:space:]]*=[[:space:]]*"?0"?[[:space:]]*$' "$CONF" && MATCH_SCREEN=0
 fi
 
 fix_address() {
@@ -59,7 +70,59 @@ fix_address() {
   rm -rf "$dir"
 }
 
+# key=value in the [General] section of Moonlight.conf
+set_key() {
+  if grep -q "^$1=" "$ML_CONF"; then
+    sed -i "s/^$1=.*/$1=$2/" "$ML_CONF"
+  else
+    sed -i "/^\[General\]$/a $1=$2" "$ML_CONF"
+  fi
+}
+
+match_screen() {
+  if [ "$MATCH_SCREEN" = 0 ]; then
+    rm -f "$STATE"
+    return 0
+  fi
+  local mode w h fps x y a res="" rate_given="" rate
+  mode=$(python3 "$(dirname "$SELF")/moonlight-screen" 2>/dev/null)
+  read -r w h fps x y <<< "$mode"
+  if [ -z "$y" ]; then  # no extension and several screens: Moonlight's own settings
+    rm -f "$STATE"
+    return 0
+  fi
+  if [ "${ARGS[0]:-}" = stream ]; then
+    local fps_given=""
+    for a in "${ARGS[@]}"; do
+      case $a in
+        --resolution|--resolution=*|--720|--1080|--1440|--4K) res=1 ;;
+        --fps|--fps=*) fps_given=1 ;;
+        --bitrate|--bitrate=*) rate_given=1 ;;
+      esac
+    done
+    # (the extension leaves the windows of a "stream" start alone)
+    printf 'stream %s %s %s\n' "$x" "$y" "$SELF" > "$STATE"
+    [ -n "$res" ] && [ -n "$fps_given" ] && return 0
+    [ -n "$res" ] || ARGS+=(--resolution "${w}x$h")
+    [ -n "$fps_given" ] || ARGS+=(--fps "$fps")
+    # A resolution or frame rate on the command line makes Moonlight pick its default bitrate:
+    # keep the one of its settings.
+    if [ -z "$rate_given" ] && [ -f "$ML_CONF" ]; then
+      rate=$(sed -n 's/^bitrate=\([0-9][0-9]*\)$/\1/p' "$ML_CONF" | head -1)
+      [ -n "$rate" ] && ARGS+=(--bitrate "$rate")
+    fi
+  elif [ ${#ARGS[@]} -eq 0 ]; then
+    [ -f "$ML_CONF" ] || return 0
+    pgrep -x moonlight >/dev/null && return 0  # it reads its settings once, at startup
+    set_key width "$w"
+    set_key height "$h"
+    set_key fps "$fps"
+    printf 'gui %s %s %s\n' "$x" "$y" "$SELF" > "$STATE"
+  fi
+}
+
 while IFS=$'\t' read -r HOST LAN_ADDRESS; do
   fix_address
 done <<< "$PAIRS"
-exec flatpak run com.moonlight_stream.Moonlight "$@"
+match_screen
+exec flatpak run com.moonlight_stream.Moonlight "${ARGS[@]}"
