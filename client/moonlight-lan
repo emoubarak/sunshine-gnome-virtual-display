@@ -79,20 +79,28 @@ set_key() {
   fi
 }
 
-match_screen() {
-  if [ "$MATCH_SCREEN" = 0 ]; then
+# What moonlight-lan did, for the extension: "KIND X Y PID LAUNCHER". `flatpak run` keeps this
+# PID, Moonlight's windows are its descendants. No file: the extension leaves Moonlight alone.
+note_screen() {
+  if [ $# -eq 0 ]; then
     rm -f "$STATE"
-    return 0
+  else
+    printf '%s %s %s %s %s\n' "$1" "$2" "$3" "$$" "$SELF" > "$STATE"
   fi
-  local mode w h fps x y a res="" rate_given="" rate
+}
+
+match_screen() {
+  note_screen
+  [ "$MATCH_SCREEN" = 0 ] && return 0
+  local mode w h fps x y a res="" fps_given="" rate_given="" auto=1 rate=""
   mode=$(python3 "$(dirname "$SELF")/moonlight-screen" 2>/dev/null)
   read -r w h fps x y <<< "$mode"
-  if [ -z "$y" ]; then  # no extension and several screens: Moonlight's own settings
-    rm -f "$STATE"
-    return 0
+  [ -n "$y" ] || return 0  # no extension: Moonlight's own settings
+  if [ -f "$ML_CONF" ]; then
+    grep -qx 'autoadjustbitrate=false' "$ML_CONF" && auto=0
+    rate=$(sed -n 's/^bitrate=\([0-9][0-9]*\)$/\1/p' "$ML_CONF" | head -1)
   fi
   if [ "${ARGS[0]:-}" = stream ]; then
-    local fps_given=""
     for a in "${ARGS[@]}"; do
       case $a in
         --resolution|--resolution=*|--720|--1080|--1440|--4K) res=1 ;;
@@ -100,24 +108,23 @@ match_screen() {
         --bitrate|--bitrate=*) rate_given=1 ;;
       esac
     done
-    # (the extension leaves the windows of a "stream" start alone)
-    printf 'stream %s %s %s\n' "$x" "$y" "$SELF" > "$STATE"
+    note_screen stream "$x" "$y"
     [ -n "$res" ] && [ -n "$fps_given" ] && return 0
     [ -n "$res" ] || ARGS+=(--resolution "${w}x$h")
     [ -n "$fps_given" ] || ARGS+=(--fps "$fps")
-    # A resolution or frame rate on the command line makes Moonlight pick its default bitrate:
-    # keep the one of its settings.
-    if [ -z "$rate_given" ] && [ -f "$ML_CONF" ]; then
-      rate=$(sed -n 's/^bitrate=\([0-9][0-9]*\)$/\1/p' "$ML_CONF" | head -1)
-      [ -n "$rate" ] && ARGS+=(--bitrate "$rate")
+    # With --resolution or --fps Moonlight takes its default bitrate for that mode: right when
+    # it adjusts the bitrate itself, a fixed bitrate chosen in its settings is passed on.
+    if [ -z "$rate_given" ] && [ "$auto" = 0 ] && [ -n "$rate" ]; then
+      ARGS+=(--bitrate "$rate")
     fi
-  elif [ ${#ARGS[@]} -eq 0 ]; then
-    [ -f "$ML_CONF" ] || return 0
+  elif [ ${#ARGS[@]} -eq 0 ] && [ -f "$ML_CONF" ]; then
     pgrep -x moonlight >/dev/null && return 0  # it reads its settings once, at startup
     set_key width "$w"
     set_key height "$h"
     set_key fps "$fps"
-    printf 'gui %s %s %s\n' "$x" "$y" "$SELF" > "$STATE"
+    # Without a saved bitrate Moonlight takes its default for the new mode.
+    [ "$auto" = 1 ] && sed -i '/^bitrate=/d' "$ML_CONF"
+    note_screen gui "$x" "$y"
   fi
 }
 

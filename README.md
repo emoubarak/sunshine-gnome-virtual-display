@@ -102,9 +102,11 @@ ports that only exist when a dock or a USB-C device is attached. Use the kernel'
   monitor gets black bars on the sides. Start Moonlight with `client/moonlight-lan` and add the
   GNOME Shell extension next to it: each stream then takes the resolution and refresh rate of the
   screen Moonlight opens on, and moving the Moonlight window to another screen before a stream
-  reopens Moonlight there, with that screen's mode. Desktop entries that start a stream directly
+  reopens Moonlight there, with that screen's mode (never during a stream, and only for a Moonlight
+  started by `moonlight-lan`). Desktop entries that start a stream directly
   (`moonlight-lan stream HOST APP`) get `--resolution` and `--fps` too, unless they give them.
-  `MATCH_SCREEN=0` in `~/.config/gnome-virtual-display/moonlight-lan.conf` turns it off.
+  `MATCH_SCREEN=0` in `~/.config/gnome-virtual-display/moonlight-lan.conf` turns it off; without
+  the extension Moonlight keeps its own settings.
 
   ```bash
   ln -s "$PWD/client/moonlight-lan" ~/.local/bin/moonlight-lan

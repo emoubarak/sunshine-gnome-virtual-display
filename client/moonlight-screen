@@ -5,9 +5,8 @@ Prints "WIDTH HEIGHT FPS X Y": the screen's current mode in real pixels (rotatio
 its refresh rate rounded, then the screen's position in the GNOME layout. The screen is:
   - the one at MOONLIGHT_SCREEN="X,Y" (set when the extension reopens Moonlight on another screen);
   - else the one under the pointer, where Mutter opens a new window, as told by the
-    moonlight-screen@sunshine-gnome-virtual-display GNOME Shell extension;
-  - else the only screen switched on.
-Exits with 1 when it cannot tell (extension missing and several screens on).
+    moonlight-screen@sunshine-gnome-virtual-display GNOME Shell extension.
+Exits with 1 without the extension: Moonlight then keeps its own settings.
 """
 import os
 import sys
@@ -25,7 +24,7 @@ def call(bus, dest, path, method):
     return reply.unpack()
 
 
-def target_origin(bus, logical):
+def target_origin(bus):
     value = os.environ.get("MOONLIGHT_SCREEN", "")
     if value:
         try:
@@ -38,16 +37,14 @@ def target_origin(bus, logical):
                             "PointerMonitor")
         return x, y
     except GLib.Error:
-        if len(logical) == 1:
-            return logical[0][0], logical[0][1]
-    return None
+        return None
 
 
 def main():
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     _serial, monitors, logical, _props = call(bus, "org.gnome.Mutter.DisplayConfig",
                                               "/org/gnome/Mutter/DisplayConfig", "GetCurrentState")
-    origin = target_origin(bus, logical)
+    origin = target_origin(bus)
     if origin is None:
         return 1
     for x, y, _scale, transform, _primary, outputs, _props in logical:

@@ -28,7 +28,7 @@ ML="$HOME/.var/app/com.moonlight_stream.Moonlight/config/Moonlight Game Streamin
 mkdir -p "$EXT/helper@test" "$T/bin" "$(dirname "$ML")"
 chmod 700 "$RT"
 ln -s "$REPO/client/$UUID" "$EXT/"
-printf '[General]\nbitrate=150000\nfps=120\nheight=1600\nwidth=2400\n\n[hosts]\n' > "$ML"
+printf '[General]\nautoadjustbitrate=false\nbitrate=150000\nfps=120\nheight=1600\nwidth=2400\n\n[hosts]\n' > "$ML"
 : > "$FAKE_LOG"
 
 cat > "$EXT/helper@test/metadata.json" <<'EOF'
@@ -50,7 +50,7 @@ export default class Helper extends Extension {
   Warp(x, y) { Clutter.get_default_backend().get_default_seat().warp_pointer(x, y); }
   Move(i) {
     const w = global.get_window_actors().map(a => a.meta_window)
-      .find(w => w.get_wm_class() === 'com.moonlight_stream.Moonlight' && !w.is_fullscreen());
+      .find(w => w.get_wm_class() === 'com.moonlight_stream.Moonlight');
     if (!w) return false;
     w.move_to_monitor(i);
     return true;
@@ -69,12 +69,19 @@ with open(os.environ['FAKE_LOG'], 'a') as f:
     f.write(json.dumps({'args': sys.argv[1:], 'conf': values}) + '\n')
 app = Gtk.Application(application_id='com.moonlight_stream.Moonlight', flags=Gio.ApplicationFlags.NON_UNIQUE)
 def activate(a):
-    Gtk.ApplicationWindow(application=a, title='Moonlight', default_width=800, default_height=600).present()
+    main = Gtk.ApplicationWindow(application=a, title='Moonlight', default_width=800, default_height=600)
+    main.present()
     if os.environ.get('FAKE_STREAM_AFTER'):
+        # Like Moonlight: the main window is hidden while the stream window ("<host> - Moonlight",
+        # here windowed) is open, and shown again after it.
         def stream():
-            s = Gtk.Window(application=a, title='Moonlight stream')
-            s.fullscreen()
+            main.set_visible(False)
+            s = Gtk.Window(application=a, title='host - Moonlight', default_width=1280, default_height=720)
             s.present()
+            def end():
+                main.set_visible(True)
+                s.destroy()
+            GLib.timeout_add(int(float(os.environ['FAKE_STREAM_FOR']) * 1000), end)
         GLib.timeout_add(int(float(os.environ['FAKE_STREAM_AFTER']) * 1000), stream)
 app.connect('activate', activate)
 app.run([])
@@ -143,12 +150,38 @@ quit_fake
 
 warp 1000 500
 : > "$FAKE_LOG"
-FAKE_STREAM_AFTER=2 "$REPO/client/moonlight-lan" > /dev/null 2>&1 &
+FAKE_STREAM_AFTER=2 FAKE_STREAM_FOR=8 "$REPO/client/moonlight-lan" > /dev/null 2>&1 &
+sleep 4
+check "stream: main window hidden, stream window alone" "$(windows)" "0"
+H Move 1 > /dev/null
+sleep 4
+check "stream window moved: Moonlight not started again" "$(wc -l < "$FAKE_LOG")" "1"
+check "stream window moved: still open" "$(windows)" "1"
+warp 3000 500  # the main window comes back under the pointer, on the other screen
+sleep 6
+check "after the stream: main window back on its screen" "$(windows)" "0,tracked"
+check "after the stream: Moonlight not started again" "$(wc -l < "$FAKE_LOG")" "1"
+quit_fake
+
+warp 1000 500
+: > "$FAKE_LOG"
+"$REPO/client/moonlight-lan" pair host > /dev/null 2>&1 &
+sleep 4
+check "pair: no screen file" "$(state)" ""
+H Move 1 > /dev/null
+sleep 4
+check "pair: window left alone" "$(windows) $(wc -l < "$FAKE_LOG")" "1 1"
+quit_fake
+
+"$REPO/client/moonlight-lan" > /dev/null 2>&1 &
+sleep 4
+quit_fake  # leaves a "gui" screen file behind
+: > "$FAKE_LOG"
+flatpak run com.moonlight_stream.Moonlight > /dev/null 2>&1 &
 sleep 4
 H Move 1 > /dev/null
-sleep 5
-check "stream running: not started again" "$(wc -l < "$FAKE_LOG")" "1"
-check "stream running: windows" "$(windows)" "1,tracked 0,fs"
+sleep 4
+check "started without moonlight-lan: left alone" "$(windows) $(wc -l < "$FAKE_LOG")" "1 1"
 quit_fake
 
 warp 3000 500
@@ -157,20 +190,40 @@ warp 3000 500
 sleep 3
 "$REPO/client/moonlight-lan" stream host Remote --fps 30 --bitrate 10000 > /dev/null 2>&1 &
 sleep 3
-check "stream: arguments added" "$(sed -n 1p "$FAKE_LOG" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["args"]))')" \
+args() { sed -n "${1}p" "$FAKE_LOG" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["args"]))'; }
+check "stream: arguments added, fixed bitrate kept" "$(args 1)" \
   "stream host Virtual only --resolution 1920x1080 --fps 60 --bitrate 150000"
-check "stream: given ones kept" "$(sed -n 2p "$FAKE_LOG" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["args"]))')" \
-  "stream host Remote --fps 30 --bitrate 10000 --resolution 1920x1080"
+check "stream: given ones kept" "$(args 2)" "stream host Remote --fps 30 --bitrate 10000 --resolution 1920x1080"
 check "stream: windows left alone" "$(windows)" "1 1"
+quit_fake
+
+sed -i '/^autoadjustbitrate=/d' "$ML"  # Moonlight's default: it adjusts the bitrate itself
+: > "$FAKE_LOG"
+"$REPO/client/moonlight-lan" stream host "Virtual only" > /dev/null 2>&1 &
+sleep 3
+check "auto bitrate, stream: no --bitrate" "$(args 1)" "stream host Virtual only --resolution 1920x1080 --fps 60"
+quit_fake
+"$REPO/client/moonlight-lan" > /dev/null 2>&1 &
+sleep 4
+check "auto bitrate, plain start: saved bitrate dropped" "$(grep -c '^bitrate=' "$ML")" "0"
 quit_fake
 
 mkdir -p "$XDG_CONFIG_HOME/gnome-virtual-display"
 printf 'MATCH_SCREEN=0\n' > "$XDG_CONFIG_HOME/gnome-virtual-display/moonlight-lan.conf"
+sed -i -e 's/^fps=.*/fps=120/' -e 's/^height=.*/height=1600/' -e 's/^width=.*/width=2400/' "$ML"
 warp 3000 500  # the 1920x1080 screen, while the settings say 2400x1600
 "$REPO/client/moonlight-lan" > /dev/null 2>&1 &
 sleep 4
 check "MATCH_SCREEN=0: settings untouched" "$(conf)" "fps=120 height=1600 width=2400 "
 check "MATCH_SCREEN=0: no screen file" "$(state)" ""
+quit_fake
+rm "$XDG_CONFIG_HOME/gnome-virtual-display/moonlight-lan.conf"
+
+call /org/gnome/Shell org.gnome.Shell.Extensions DisableExtension "$UUID" > /dev/null
+sleep 1
+"$REPO/client/moonlight-lan" > /dev/null 2>&1 &
+sleep 4
+check "without the extension: settings untouched" "$(conf)" "fps=120 height=1600 width=2400 "
 quit_fake
 
 if grep -q "JS ERROR" "$T/shell.log"; then

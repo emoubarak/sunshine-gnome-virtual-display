@@ -4,12 +4,13 @@
 // On a client with several screens (a 3:2 laptop panel and a 16:9 monitor), a stream started on
 // the other screen gets black bars. This extension works with client/moonlight-lan:
 //   - PointerMonitor() over D-Bus: the screen under the pointer, where Mutter opens a new window.
-//     moonlight-lan gives Moonlight that screen's mode before starting it, and writes the screen
-//     it chose in $XDG_RUNTIME_DIR/moonlight-lan.screen ("gui X Y LAUNCHER").
-//   - When the Moonlight window is then moved to another screen (drag, Super+Shift+arrow) and no
-//     stream is running, Moonlight is closed and started again through moonlight-lan with
-//     MOONLIGHT_SCREEN="X,Y", and its new window is put on that screen.
-// Windows(): debug list of the windows (journalctl -b /usr/bin/gnome-shell for the logs).
+//     moonlight-lan gives Moonlight that screen's mode before starting it, and writes what it did
+//     in $XDG_RUNTIME_DIR/moonlight-lan.screen: "gui X Y PID LAUNCHER" (PID: its own, which
+//     `flatpak run` keeps, so Moonlight's windows are its descendants).
+//   - The main window of that start is kept on that screen. When it is moved to another screen
+//     (drag, Super+Shift+arrow) and no stream is running, Moonlight is closed and started again
+//     through moonlight-lan with MOONLIGHT_SCREEN="X,Y", and its new window put on that screen.
+// Windows(): debug list of the windows. Logs: journalctl -b /usr/bin/gnome-shell | grep moonlight
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
@@ -33,8 +34,7 @@ const IFACE = `<node>
 </node>`;
 
 const SETTLE_MS = 700;       // a move is over once the window stays put this long
-const MAP_GRACE_MS = 2000;   // placement right after the window opens is not a move
-const FRESH_S = 30;          // moonlight-lan wrote the screen this recently: it started this window
+const MAP_GRACE_MS = 2000;   // placement right after the window shows is not a move
 const EXIT_WAIT_MS = 8000;   // Moonlight stops its host polling before it quits
 
 function log(message) {
@@ -42,13 +42,19 @@ function log(message) {
 }
 
 function isMoonlight(win) {
-    return win.get_sandboxed_app_id?.() === APP_ID || win.get_wm_class() === APP_ID;
+    return win.get_window_type() === Meta.WindowType.NORMAL &&
+        (win.get_sandboxed_app_id?.() === APP_ID || win.get_wm_class() === APP_ID);
+}
+
+// The stream window: "<host> - Moonlight" (session.cpp), fullscreen or not. The main window is
+// hidden while it is open.
+function isStream(win) {
+    return win.is_fullscreen() || (win.get_title() ?? '').endsWith(' - Moonlight');
 }
 
 function moonlightWindows() {
-    return global.get_window_actors()
-        .map(actor => actor.meta_window)
-        .filter(win => win && win.get_window_type() === Meta.WindowType.NORMAL && isMoonlight(win));
+    return global.get_window_actors().map(actor => actor.meta_window)
+        .filter(win => win && isMoonlight(win));
 }
 
 function monitorAt(x, y) {
@@ -60,15 +66,30 @@ function monitorAt(x, y) {
     return -1;
 }
 
+function parentPid(pid) {
+    try {
+        const [, bytes] = GLib.file_get_contents(`/proc/${pid}/stat`);
+        const stat = new TextDecoder().decode(bytes);
+        return parseInt(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+    } catch {
+        return 0;
+    }
+}
+
+function descendsFrom(pid, ancestor) {
+    for (let i = 0; i < 32 && pid > 1; i++, pid = parentPid(pid)) {
+        if (pid === ancestor)
+            return true;
+    }
+    return false;
+}
+
 function readState() {
     const path = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'moonlight-lan.screen']);
     try {
         const [, bytes] = GLib.file_get_contents(path);
-        const [kind, x, y, ...launcher] = new TextDecoder().decode(bytes).trim().split(' ');
-        const info = Gio.File.new_for_path(path).query_info('time::modified',
-            Gio.FileQueryInfoFlags.NONE, null);
-        const age = GLib.get_real_time() / 1e6 - info.get_modification_date_time().to_unix();
-        return {kind, x: parseInt(x), y: parseInt(y), launcher: launcher.join(' '), age};
+        const [kind, x, y, pid, ...launcher] = new TextDecoder().decode(bytes).trim().split(' ');
+        return {kind, x: parseInt(x), y: parseInt(y), pid: parseInt(pid), launcher: launcher.join(' ')};
     } catch {
         return null;
     }
@@ -77,6 +98,7 @@ function readState() {
 export default class MoonlightScreenExtension extends Extension {
     enable() {
         this._windows = new Map();
+        this._shown = new Map();
         this._sources = new Set();
         this._grabbing = false;
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
@@ -100,6 +122,9 @@ export default class MoonlightScreenExtension extends Extension {
     disable() {
         for (const id of this._displaySignals)
             global.display.disconnect(id);
+        for (const [win, ids] of this._shown)
+            ids.forEach(id => win.disconnect(id));
+        this._shown.clear();
         for (const win of [...this._windows.keys()])
             this._untrack(win);
         for (const id of this._sources)
@@ -137,44 +162,39 @@ export default class MoonlightScreenExtension extends Extension {
     }
 
     _onCreated(win) {
-        // A Wayland window gets its app id (wm_class) and its place a moment after it is created.
-        let tries = 0;
-        const attempt = () => {
-            if (win.get_compositor_private() && win.get_wm_class())
-                this._track(win, false);
-            else if (++tries < 20)
-                this._later(250, attempt);
+        // Shown: Mutter has placed it, and a Wayland window has its app id by then.
+        const done = () => {
+            for (const id of this._shown.get(win) ?? [])
+                win.disconnect(id);
+            this._shown.delete(win);
         };
-        this._later(250, attempt);
+        this._shown.set(win, [
+            win.connect('shown', () => {
+                done();
+                this._track(win, false);
+            }),
+            win.connect('unmanaged', done),
+        ]);
     }
 
     _track(win, existing) {
-        if (this._windows.has(win) || !win.get_compositor_private() || !isMoonlight(win) ||
-            win.get_window_type() !== Meta.WindowType.NORMAL)
+        if (this._windows.has(win) || !isMoonlight(win) || isStream(win))
             return;
         const state = readState();
-        // Only the main window of a plain start; a stream window opens next to it.
-        if (!state || state.kind !== 'gui' || moonlightWindows().length > 1)
+        // Only the windows of a plain start by moonlight-lan.
+        if (!state || state.kind !== 'gui' || !descendsFrom(win.get_pid(), state.pid))
             return;
-        const rec = {state, mappedAt: GLib.get_monotonic_time(), relaunched: false, timeout: 0};
+        const rec = {state, shownAt: GLib.get_monotonic_time(), relaunched: false, timeout: 0};
         rec.signals = [
             win.connect('position-changed', () => this._schedule(win)),
             win.connect('unmanaged', () => this._untrack(win)),
         ];
         this._windows.set(win, rec);
         const target = monitorAt(state.x, state.y);
-        if (existing || target < 0 || win.get_monitor() === target)
-            return;
-        if (state.age < FRESH_S) {
-            // Started by moonlight-lan for that screen (after a Super+Shift+arrow the pointer,
-            // where Mutter opens windows, may be on another one).
-            this._later(300, () => {
-                if (this._windows.has(win) && win.get_monitor() !== target)
-                    win.move_to_monitor(target);
-            });
-        } else {
-            this._schedule(win);
-        }
+        // Its settings are for that screen: a new window opens under the pointer, possibly on
+        // another one (start after Super+Shift+arrow, main window shown again after a stream).
+        if (!existing && target >= 0 && win.get_monitor() !== target)
+            win.move_to_monitor(target);
     }
 
     _untrack(win) {
@@ -208,13 +228,13 @@ export default class MoonlightScreenExtension extends Extension {
         const rec = this._windows.get(win);
         if (!rec || rec.relaunched || this._grabbing)
             return;
-        if ((GLib.get_monotonic_time() - rec.mappedAt) / 1000 < MAP_GRACE_MS) {
+        if ((GLib.get_monotonic_time() - rec.shownAt) / 1000 < MAP_GRACE_MS) {
             this._schedule(win);
             return;
         }
         const windows = moonlightWindows();
-        if (windows.length !== 1 || windows[0] !== win || win.is_fullscreen())
-            return;  // a stream is running
+        if (windows.length !== 1 || windows[0] !== win || windows.some(isStream))
+            return;  // a stream is running, or another Moonlight is open
         const r = global.display.get_monitor_geometry(win.get_monitor());
         if (r.x === rec.state.x && r.y === rec.state.y)
             return;

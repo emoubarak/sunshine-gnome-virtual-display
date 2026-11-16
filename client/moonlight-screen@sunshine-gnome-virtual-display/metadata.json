@@ -2,6 +2,17 @@
   "uuid": "moonlight-screen@sunshine-gnome-virtual-display",
   "name": "Moonlight screen",
   "description": "Tells moonlight-lan which screen Moonlight opens on, and reopens Moonlight on the screen its window is moved to, so the stream always takes the resolution of the screen it is shown on.",
-  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ],
   "url": "https://github.com/emoubarak/sunshine-gnome-virtual-display"
 }
