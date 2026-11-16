@@ -46,10 +46,10 @@ function isMoonlight(win) {
         (win.get_sandboxed_app_id?.() === APP_ID || win.get_wm_class() === APP_ID);
 }
 
-// The stream window: "<host> - Moonlight" (session.cpp), fullscreen or not. The main window is
-// hidden while it is open.
+// The stream window: "<host> - Moonlight" (session.cpp), fullscreen or not. The main window
+// ("Moonlight", fullscreen too with that UI setting) is hidden while it is open.
 function isStream(win) {
-    return win.is_fullscreen() || (win.get_title() ?? '').endsWith(' - Moonlight');
+    return (win.get_title() ?? '').endsWith(' - Moonlight');
 }
 
 function moonlightWindows() {
