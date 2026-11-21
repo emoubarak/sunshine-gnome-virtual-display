@@ -133,6 +133,13 @@ every GDM start, a user unit unplugs it at the end of each session, and the next
 After a reboot, Sunshine (started by the user manager before any session) streams the login screen,
 so you can log in from the client.
 
+Sunshine can start before the greeter has put a picture on the monitor. Its KMS capture then fails
+(`Unable to find display or encoder during startup`), it drops its capabilities and stays up with no
+capture, so Moonlight connects to nothing. The watcher only runs inside a session, so a second user
+service (`sunshine-login-guard`, `gnome-virtual-display login-guard`) covers this window: with no
+session, when Sunshine has run 15 s and its log ends that way, it restarts Sunshine, waiting 0, 15,
+30, 60 then 120 s between two tries. It does nothing once a session is open.
+
 ## Xwayland freeze
 
 With some X11 clients that present frames through the Present extension (browsers forced to X11 with

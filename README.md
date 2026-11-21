@@ -83,7 +83,8 @@ What the installer changes, so nothing surprises you:
 - `capture` and `output_name` in `sunshine.conf` and three entries in `apps.json`, after a backup in
   `~/.local/state/gnome-virtual-display/backup/` (`--no-sunshine-config` to skip);
 - Sunshine started at boot (user lingering on, Sunshine wanted by `default.target`), so the login
-  screen can be streamed after a reboot (`--no-boot-start` to skip).
+  screen can be streamed after a reboot, and a small service that restarts it when that start has no
+  capture (`--no-boot-start` to skip both).
 
 Useful options: `--connector DP-3` to pick the output yourself, `--edid panel.bin` to inject the real
 EDID of your client's panel (the virtual monitor starts with it; other clients still get their own

@@ -384,6 +384,33 @@ gvd.DRM_CONF = os.path.join(TMP, "drm.conf")
 check("host: same connector name on the other GPU (drm.conf) -> a monitor",
       gvd.physical_connected(), True)
 
+# --- login-guard -----------------------------------------------------------------------------
+BAD = "Error: Unable to initialize capture method\n" + gvd.LOGIN_FAILED + "\n"
+GOOD = "Info: Screencasting with KMS\n"
+g = {"tries": 0, "last": 0.0}
+step = gvd.login_guard_step
+check("guard: failed start at the login screen -> restart", step(g, 1000, False, 980, BAD), True)
+check("guard: next look right after -> back-off", step(g, 1001, False, 1000 - 1 + 1, BAD), False)
+check("guard: 15 s later, still failed -> restart again", step(g, 1016, False, 1000, BAD), True)
+check("guard: 20 s later (30 s back-off) -> wait", step(g, 1036, False, 1000, BAD), False)
+check("guard: 30 s after the 2nd -> restart", step(g, 1046, False, 1000, BAD), True)
+check("guard: tries counted", g["tries"], 3)
+check("guard: Sunshine just started -> log not judged", step(g, 5000, False, 4995, BAD), False)
+check("guard: Sunshine not running -> systemd's job", step(g, 5000, False, None, BAD), False)
+check("guard: capture started -> nothing, tries reset", (step(g, 5000, False, 4900, GOOD), g["tries"]),
+      (False, 0))
+g = {"tries": 0, "last": 0.0}
+check("guard: a session is open -> nothing", step(g, 1000, True, 900, BAD), False)
+g = {"tries": 9, "last": 0.0}
+check("guard: back-off capped at 120 s", (step(g, 100, False, 0, BAD), step(g, 220, False, 0, BAD)),
+      (False, True))
+check("guard: login marker is Sunshine's own line",
+      gvd.LOGIN_FAILED, "Unable to find display or encoder during startup")
+gvd.proxy = lambda: type("P", (), {"get_name_owner": lambda self: None})()
+check("session_open: no gnome-shell on the bus", gvd.session_open(), False)
+gvd.proxy = lambda: type("P", (), {"get_name_owner": lambda self: ":1.42"})()
+check("session_open: gnome-shell on the bus", gvd.session_open(), True)
+
 print()
 print("FAILED: " + ", ".join(FAILED) if FAILED else "ALL OK")
 sys.exit(1 if FAILED else 0)

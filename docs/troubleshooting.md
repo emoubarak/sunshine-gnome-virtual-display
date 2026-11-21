@@ -50,6 +50,13 @@ After a stream the tool puts back the layout it learnt before it, from
 stream and it learns them within seconds. To start over: delete `prefs.json`, then run
 `gnome-virtual-display base`.
 
+## Login screen not streamed after a reboot
+
+`journalctl --user -u app-dev.lizardbyte.app.Sunshine.service -b` ends with `Unable to find display
+or encoder during startup` and `systemctl --user status sunshine-login-guard` is not running: the
+guard restarts Sunshine by itself (`journalctl -t gnome-virtual-display | grep login-guard`). Without
+it, `systemctl --user restart app-dev.lizardbyte.app.Sunshine.service` fixes it by hand.
+
 ## Black screen on the host
 
 ```bash

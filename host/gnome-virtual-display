@@ -42,6 +42,7 @@ Usage:
   gnome-virtual-display off           # removes the virtual monitor (unplugs the connector)
   gnome-virtual-display watch         # watches display changes (service)
   gnome-virtual-display fix-session   # frozen desktop: restarts GDM (login screen)
+  gnome-virtual-display login-guard   # no session: restarts Sunshine if its start failed (service)
 
 Configuration: ~/.config/gnome-virtual-display/config.toml, or the file named
 by $GVD_CONFIG. Every key is optional except `connector`:
@@ -110,6 +111,13 @@ EXIT_SESSION = 3
 FREEZE_DELAY = 60
 FREEZE_SEEN = 3
 GDM_RESTART = ["sudo", "-n", "/usr/bin/systemctl", "restart", "gdm.service"]
+# Sunshine started before any session (boot) can fail its KMS init and then never recovers: it keeps
+# running without capture or encoder, and dropped its capabilities. `login-guard` restarts it. This
+# line of its log ends such a start (a good start never writes it).
+LOGIN_FAILED = "Unable to find display or encoder during startup"
+GUARD_PERIOD = 5  # seconds between two looks
+GUARD_UP = 15  # Sunshine must have run this long before its log is judged
+GUARD_BACKOFF = (0, 15, 30, 60, 120)  # wait before the n-th restart in a row (the last one repeats)
 MONITORS_XML = os.path.expanduser("~/.config/monitors.xml")
 STATE_DIR = os.path.expanduser("~/.local/state/gnome-virtual-display")
 MODE_FILE = os.path.join(STATE_DIR, "mode")
@@ -3027,6 +3035,60 @@ def cmd_watch():
     loop.run()
 
 
+def session_open():
+    """Is there a gnome-shell of the user (a session, not the login screen)?"""
+    try:
+        return proxy().get_name_owner() is not None
+    except GLib.Error:
+        return False
+
+
+def login_guard_step(g, now, session, started, log):
+    """One look of `login-guard`. -> True when Sunshine must be restarted.
+
+    `g` keeps {"tries", "last"} between two looks. `started`: when Sunshine started (None: not
+    running, systemd restarts it). A session ends the guard's work (the watcher takes over).
+    """
+    if session:
+        g["tries"] = 0
+        return False
+    if started is None or now - started < GUARD_UP:
+        return False
+    if LOGIN_FAILED not in log:
+        g["tries"] = 0
+        return False
+    if now - g["last"] < GUARD_BACKOFF[min(g["tries"], len(GUARD_BACKOFF) - 1)]:
+        return False
+    g["tries"] += 1
+    g["last"] = now
+    return True
+
+
+def cmd_login_guard():
+    """Service: before any session (boot), restarts Sunshine when its start failed.
+
+    The watcher only runs inside a session. At the login screen nothing else notices that Sunshine
+    started without capture, and Moonlight then connects to nothing until someone restarts it.
+    Restarts back off (0, 15, 30, 60, 120 s, then every 120 s) until the capture starts.
+    """
+    g = {"tries": 0, "last": 0.0}
+    while True:
+        try:
+            now = time.time()
+            session = session_open()
+            started = None if session else sunshine_started_at()
+            log = "" if session or started is None else log_tail()
+            if login_guard_step(g, now, session, started, log):
+                message = (f"Sunshine started without capture before any session: restart "
+                           f"{g['tries']}")
+                print(f"login-guard: {message}", flush=True)
+                journal(f"login-guard: {message}")
+                restart_sunshine()
+        except Exception as e:  # never die on a one-off error
+            print(f"login-guard: {e}", flush=True)
+        time.sleep(GUARD_PERIOD)
+
+
 def cmd_fix_session():
     """Frozen desktop: restarts GDM. Does nothing if gnome-shell answers.
 
@@ -3059,7 +3121,7 @@ def usage():
 # waiting (cmd_reapply); the others do not take it here.
 LOCKED_ACTIONS = ("extend", "on", "only", "remote", "base", "off", "wait", "prep",
                   "boot", "scale", "rotate", "undo")
-UNLOCKED_ACTIONS = ("list", "watch", "fix-session", "reapply", "hold", "sync-apps")
+UNLOCKED_ACTIONS = ("list", "watch", "fix-session", "reapply", "hold", "sync-apps", "login-guard")
 
 
 def main(argv):
@@ -3116,6 +3178,8 @@ def main(argv):
         return 0
     if action == "fix-session":
         return cmd_fix_session()
+    if action == "login-guard":
+        return cmd_login_guard()
     return usage()
 
 

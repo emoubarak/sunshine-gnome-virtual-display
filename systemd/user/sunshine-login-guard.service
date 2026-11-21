@@ -1,0 +1,15 @@
+# Before any session (boot, login screen): restarts Sunshine when its start failed. Sunshine can start
+# before the greeter has a framebuffer, fail its KMS init and then stay without capture or encoder.
+# The watcher only runs inside a session, so this one covers the login screen. It does nothing once
+# a session is open.
+[Unit]
+Description=Restart Sunshine when it started without capture at boot (gnome-virtual-display)
+After=@SUNSHINE_UNIT@
+
+[Service]
+ExecStart=%h/.local/bin/gnome-virtual-display login-guard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

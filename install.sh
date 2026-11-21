@@ -76,9 +76,9 @@ if [ $UNINSTALL = 1 ]; then
   SUNSHINE_UNIT=${SUNSHINE_UNIT:-$(detect_sunshine_unit)}
   say "Stopping and removing user units"
   systemctl --user disable --now gnome-virtual-display-watch.service gnome-virtual-display-session-end.service \
-    stream-qos-watch.service 2>/dev/null || true
+    stream-qos-watch.service sunshine-login-guard.service 2>/dev/null || true
   rm -f "$UNITS"/gnome-virtual-display-watch.service "$UNITS"/gnome-virtual-display-session-end.service \
-    "$UNITS"/stream-qos-watch.service
+    "$UNITS"/stream-qos-watch.service "$UNITS"/sunshine-login-guard.service
   [ -n "$SUNSHINE_UNIT" ] && rm -f "$UNITS/$SUNSHINE_UNIT.d/gnome-virtual-display.conf"
   systemctl --user daemon-reload
   rm -f "$BIN"/gnome-virtual-display "$BIN"/make-edid "$BIN"/stream-qos-watch
@@ -364,6 +364,12 @@ if [ $BOOT_START = 1 ]; then
   if [ ! -e "$UNITS/default.target.wants/$SUNSHINE_UNIT" ]; then
     systemctl --user add-wants default.target "$SUNSHINE_UNIT" >/dev/null && echo wants=1 >> "$STATE/installed"
   fi
+  # Sunshine can fail its capture init before any session and never recover: this one restarts it.
+  sed "s/@SUNSHINE_UNIT@/$SUNSHINE_UNIT/g" "$REPO/systemd/user/sunshine-login-guard.service" \
+    > "$UNITS/sunshine-login-guard.service"
+  systemctl --user daemon-reload
+  systemctl --user enable sunshine-login-guard.service >/dev/null
+  systemctl --user restart sunshine-login-guard.service
 fi
 sunshine_bin=$(command -v sunshine || true)
 if [ -n "$sunshine_bin" ] && command -v getcap >/dev/null && ! getcap "$(readlink -f "$sunshine_bin")" | grep -q cap_sys_admin; then
